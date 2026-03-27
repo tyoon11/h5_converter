@@ -118,10 +118,10 @@ def beat_similarity(signal, sampling_rate=500):
                 try:
                     alignment = dtw(beat_matrix[i], beat_matrix[i + 1])
                     dtw_dists.append(alignment.distance / fixed_length)
-                except:
+                except Exception:
                     pass
             mean_dtws[idx] = np.nanmean(dtw_dists) if dtw_dists else np.nan
-        except:
+        except Exception:
             continue
 
     return {"bs_corr": mean_corrs, "bs_dtw": mean_dtws}
@@ -141,7 +141,7 @@ def extract_beat_annotation(signal_lead2, sampling_rate):
         cleaned = nk.ecg_clean(signal_lead2, sampling_rate=sampling_rate)
         _, rpeaks = nk.ecg_peaks(cleaned, sampling_rate=sampling_rate)
         peaks = rpeaks.get("ECG_R_Peaks", [])
-    except:
+    except Exception:
         peaks = []
 
     n = len(peaks)
@@ -174,7 +174,6 @@ def extract_fiducial(signal_reordered, sampling_rate):
     fidu_point = {"fsample": [], "fiducial": []}
     fidu_feat = {k: np.nan for k in feature_keys}
 
-    # Lead II = index 1, Lead I = index 0
     sig_ii = signal_reordered[1]
     sig_i = signal_reordered[0]
 
@@ -189,7 +188,6 @@ def extract_fiducial(signal_reordered, sampling_rate):
         _, waves = nk.ecg_delineate(cleaned_ii, rpeaks, sampling_rate=sampling_rate, method="dwt", show=False)
         waves["ECG_R_Peaks"] = rpeaks
 
-        # fiducial points
         fidu_names = [
             "ECG_P_Onsets", "ECG_P_Peaks", "ECG_Q_Onsets", "ECG_P_Offsets",
             "ECG_Q_Peaks", "ECG_R_Peaks", "ECG_S_Peaks", "ECG_R_Offsets",
@@ -210,7 +208,6 @@ def extract_fiducial(signal_reordered, sampling_rate):
             fidu_point["fsample"] = [fs_list[i] for i in order]
             fidu_point["fiducial"] = [fid_list[i] for i in order]
 
-        # fiducial features
         def _interval(a, b):
             a, b = np.array(a, dtype=np.float32), np.array(b, dtype=np.float32)
             if len(a) != len(b) or len(a) <= 3:
@@ -234,28 +231,26 @@ def extract_fiducial(signal_reordered, sampling_rate):
         fidu_feat["t_amp"] = _amp(cleaned_ii, waves.get("ECG_T_Peaks", []), waves.get("ECG_T_Onsets", []))
 
         fs_rate = sampling_rate
-        fidu_feat["p_dur"] = _interval(waves.get("ECG_P_Onsets", []), waves.get("ECG_P_Offsets", [])) / fs_rate
-        fidu_feat["pr_seg"] = _interval(waves.get("ECG_P_Offsets", []), waves.get("ECG_Q_Peaks", [])) / fs_rate
+        fidu_feat["p_dur"]   = _interval(waves.get("ECG_P_Onsets", []), waves.get("ECG_P_Offsets", [])) / fs_rate
+        fidu_feat["pr_seg"]  = _interval(waves.get("ECG_P_Offsets", []), waves.get("ECG_Q_Peaks", [])) / fs_rate
         fidu_feat["qrs_dur"] = _interval(waves.get("ECG_Q_Peaks", []), waves.get("ECG_S_Peaks", [])) / fs_rate
-        fidu_feat["st_seg"] = _interval(waves.get("ECG_S_Peaks", []), waves.get("ECG_T_Onsets", [])) / fs_rate
-        fidu_feat["t_dur"] = _interval(waves.get("ECG_T_Onsets", []), waves.get("ECG_T_Offsets", [])) / fs_rate
-        fidu_feat["pr_int"] = _interval(waves.get("ECG_P_Onsets", []), waves.get("ECG_Q_Peaks", [])) / fs_rate
-        fidu_feat["qt_int"] = _interval(waves.get("ECG_Q_Peaks", []), waves.get("ECG_T_Offsets", [])) / fs_rate
-        fidu_feat["rr_int"] = _interval(rpeaks[:-1], rpeaks[1:]) / fs_rate
-        fidu_feat["tp_seg"] = _interval(waves.get("ECG_T_Offsets", [None])[:-1], waves.get("ECG_P_Onsets", [None])[1:]) / fs_rate
+        fidu_feat["st_seg"]  = _interval(waves.get("ECG_S_Peaks", []), waves.get("ECG_T_Onsets", [])) / fs_rate
+        fidu_feat["t_dur"]   = _interval(waves.get("ECG_T_Onsets", []), waves.get("ECG_T_Offsets", [])) / fs_rate
+        fidu_feat["pr_int"]  = _interval(waves.get("ECG_P_Onsets", []), waves.get("ECG_Q_Peaks", [])) / fs_rate
+        fidu_feat["qt_int"]  = _interval(waves.get("ECG_Q_Peaks", []), waves.get("ECG_T_Offsets", [])) / fs_rate
+        fidu_feat["rr_int"]  = _interval(rpeaks[:-1], rpeaks[1:]) / fs_rate
+        fidu_feat["tp_seg"]  = _interval(waves.get("ECG_T_Offsets", [None])[:-1], waves.get("ECG_P_Onsets", [None])[1:]) / fs_rate
 
         if isinstance(fidu_feat["rr_int"], float) and fidu_feat["rr_int"] > 0:
-            fidu_feat["qtc_baz"] = fidu_feat["qt_int"] / np.sqrt(fidu_feat["rr_int"])
+            fidu_feat["qtc_baz"]  = fidu_feat["qt_int"] / np.sqrt(fidu_feat["rr_int"])
             fidu_feat["qtc_frid"] = fidu_feat["qt_int"] / fidu_feat["rr_int"] ** (1 / 3)
 
-        # axis (Lead I + II)
         cleaned_i = nk.ecg_clean(sig_i, sampling_rate=sampling_rate)
         for name, pts_key in [("p_axis", "ECG_P_Peaks"), ("r_axis", "ECG_R_Peaks"), ("t_axis", "ECG_T_Peaks")]:
             pts = [p for p in waves.get(pts_key, []) if isinstance(p, (int, np.integer))]
             if pts:
                 fidu_feat[name] = float(np.nanmean(np.degrees(np.arctan2(cleaned_ii[pts], cleaned_i[pts]))))
 
-        # cast all to fp16
         fidu_feat = {
             k: np.float16(v) if isinstance(v, (float, int, np.number)) else np.float16(np.nan)
             for k, v in fidu_feat.items()

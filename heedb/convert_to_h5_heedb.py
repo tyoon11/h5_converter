@@ -4,12 +4,17 @@ HEEDB H5 변환 메인 스크립트
 I0001 + I0006 → H5 + heedb_table.csv + combined_metadata.csv + file_name.csv
 
 실행:
-  python convert_to_h5_heedb.py
-  python convert_to_h5_heedb.py --num_cpus 64
-  python convert_to_h5_heedb.py --compute_beat --compute_fiducial
+  python heedb/convert_to_h5_heedb.py
+  python heedb/convert_to_h5_heedb.py --num_cpus 64
+  python heedb/convert_to_h5_heedb.py --compute_beat --compute_fiducial
+
+신호 품질(signal quality) 계산은 기본적으로 비활성화되어 있습니다.
+별도로 계산하려면 프로젝트 루트의 append_signal_quality.py 를 사용하세요:
+  python append_signal_quality.py --csv /path/to/heedb_table.csv --h5_root /path/to/h5
 """
 
 import os
+import sys
 import argparse
 import numpy as np
 import pandas as pd
@@ -17,12 +22,15 @@ import wfdb
 import h5py
 import ray
 import logging
+from pathlib import Path
 from tqdm import tqdm
+
+# heedb/ 내부 모듈 경로 보장
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from create_h5_structure_heedb import create_h5_structure, TARGET_SIG_NAME
 from utils_heedb import (
     reorder_signal, has_zero_lead,
-    signal_statistics, beat_similarity,
     extract_beat_annotation, extract_fiducial,
 )
 
@@ -72,17 +80,22 @@ def encode_gender(val):
 @ray.remote
 def process_and_save_one(
     row_dict, rid, wfdb_root, prefix, gender_field,
-    h5_dir, compute_beat, compute_fiducial, compute_quality,
+    h5_dir, compute_beat, compute_fiducial,
 ):
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+    from create_h5_structure_heedb import create_h5_structure, TARGET_SIG_NAME
+    from utils_heedb import reorder_signal, has_zero_lead, extract_beat_annotation, extract_fiducial
+
     pid = str(row_dict.get("BDSPPatientID", "")).strip()
     fn_raw = str(row_dict.get("FileName", "")).strip().lstrip("/")
     fn_clean = fn_raw[5:] if fn_raw.startswith("WFDB/") else fn_raw
 
-    # 스킵: pid 결측
     if not pid or pid == "nan":
         return None
 
-    # WFDB 로드
     try:
         rec = wfdb.rdrecord(os.path.join(wfdb_root, fn_clean))
     except Exception:
@@ -97,7 +110,6 @@ def process_and_save_one(
     samples = sig.shape[0]
     duration = samples / fs
 
-    # 스킵: n_sig, duration, lead 집합, zero lead
     if d["n_sig"] != 12:
         return None
     if duration < 1.0:
@@ -107,41 +119,33 @@ def process_and_save_one(
     if has_zero_lead(sig):
         return None
 
-    # reorder + transpose → (12, timepoints)
-    sig_reordered = reorder_signal(sig, rec.sig_name)
+    sig_reordered = reorder_signal(sig, rec.sig_name)  # (12, timepoints)
 
-    # file_name, oid
     file_name = f"{prefix}{pid}{rid}"
     sid = 0
     oid = f"{prefix}{pid}{rid}{sid}"
 
-    # metadata reorder
     reorder_idx = [rec.sig_name.index(n) for n in TARGET_SIG_NAME]
-    fmt_r = [d["fmt"][i] for i in reorder_idx] if d.get("fmt") else None
+    fmt_r  = [d["fmt"][i]      for i in reorder_idx] if d.get("fmt")      else None
     gain_r = [d["adc_gain"][i] for i in reorder_idx] if d.get("adc_gain") else None
-    bl_r = [d["baseline"][i] for i in reorder_idx] if d.get("baseline") else None
-    units_r = [d["units"][i] for i in reorder_idx] if d.get("units") else None
-    res_r = [d["adc_res"][i] for i in reorder_idx] if d.get("adc_res") else None
+    bl_r   = [d["baseline"][i] for i in reorder_idx] if d.get("baseline") else None
+    units_r = [d["units"][i]   for i in reorder_idx] if d.get("units")    else None
+    res_r  = [d["adc_res"][i]  for i in reorder_idx] if d.get("adc_res")  else None
     zero_r = [d["adc_zero"][i] for i in reorder_idx] if d.get("adc_zero") else None
 
-    # opt: beat_annotation
-    ba_list = None
-    beat_method = ""
+    ba_list, beat_method = None, ""
     if compute_beat:
         ba = extract_beat_annotation(sig_reordered[1], fs)
         ba_list = [ba]
         beat_method = "neurokit2"
 
-    # opt: fiducial
-    fp_list, ff_list = None, None
-    fidu_method = ""
+    fp_list, ff_list, fidu_method = None, None, ""
     if compute_fiducial:
         fp, ff = extract_fiducial(sig_reordered, fs)
         fp_list = [fp]
         ff_list = [ff]
         fidu_method = "neurokit2-dwt"
 
-    # H5 저장
     h5_path = os.path.join(h5_dir, f"{file_name}.h5")
     try:
         with h5py.File(h5_path, "w") as h5f:
@@ -165,25 +169,14 @@ def process_and_save_one(
     except Exception:
         return None
 
-    # signal_quality (CSV용)
-    sq = {}
-    if compute_quality:
-        sig_for_quality = sig_reordered.T  # (timepoints, 12)
-        sq = signal_statistics(sig_for_quality)
-        bs = beat_similarity(sig_for_quality, sampling_rate=fs)
-        sq.update(bs)
-
-    # age: days → years → /100
     age_raw = row_dict.get("AgeAtAcquisition", None)
     try:
         age = float(age_raw) / 365.25 / 100
     except (TypeError, ValueError):
         age = -1
 
-    # gender
     gender = encode_gender(row_dict.get(gender_field, ""))
 
-    # CSV row
     csv_row = {
         "filepath": f"data/{file_name}.h5",
         "pid": pid, "rid": rid, "sid": sid, "oid": oid,
@@ -193,11 +186,7 @@ def process_and_save_one(
         "fs": fs,
         "channel_name": str(TARGET_SIG_NAME),
     }
-    if compute_quality:
-        for k in ["nan_ratio", "amp_mean", "amp_std", "amp_skewness", "amp_kurtosis", "bs_corr", "bs_dtw"]:
-            csv_row[k] = str(sq.get(k, []))
 
-    # file_name.csv row
     fn_row = {
         "source": "I0001" if prefix == "he1" else "I0006",
         "original_filename": d["record_name"],
@@ -213,12 +202,12 @@ def process_and_save_one(
 # 기관 1개 처리
 # ═══════════════════════════════════════════════════════════════
 def process_institution(inst, args):
-    name = inst["name"]
-    prefix = inst["prefix"]
-    base_dir = inst["base_dir"]
+    name       = inst["name"]
+    prefix     = inst["prefix"]
+    base_dir   = inst["base_dir"]
     gender_field = inst["gender_field"]
-    wfdb_root = os.path.join(base_dir, "WFDB")
-    meta_path = os.path.join(base_dir, "metadata", "metadata.csv")
+    wfdb_root  = os.path.join(base_dir, "WFDB")
+    meta_path  = os.path.join(base_dir, "metadata", "metadata.csv")
 
     logging.info(f"{'='*60}")
     logging.info(f"  {name} 시작")
@@ -227,17 +216,13 @@ def process_institution(inst, args):
     df = pd.read_csv(meta_path, dtype=str, low_memory=False)
     logging.info(f"  metadata: {len(df):,}행")
 
-    # 이미 변환된 파일 제외
     existing = set()
     if os.path.exists(DATA_DIR):
         existing = {f[:-3] for f in os.listdir(DATA_DIR) if f.endswith(".h5") and f.startswith(prefix)}
     logging.info(f"  이미 변환: {len(existing):,}개")
 
-    # 전체 rows
     rows = df.to_dict("records")
     total = len(rows)
-
-    # 전체 진행바
     pbar = tqdm(total=total, desc=f"  {name} 전체", unit="rec")
 
     all_csv_rows = []
@@ -256,14 +241,14 @@ def process_institution(inst, args):
         batch_existing = 0
         for rid_offset, row in enumerate(batch):
             rid = start + rid_offset
-            file_name = f"{prefix}{str(row.get('BDSPPatientID','')).strip()}{rid}"
+            file_name = f"{prefix}{str(row.get('BDSPPatientID', '')).strip()}{rid}"
             if file_name in existing:
                 batch_existing += 1
                 continue
             futures.append(
                 process_and_save_one.remote(
                     row, rid, wfdb_root, prefix, gender_field,
-                    DATA_DIR, args.compute_beat, args.compute_fiducial, args.compute_quality,
+                    DATA_DIR, args.compute_beat, args.compute_fiducial,
                 )
             )
 
@@ -281,7 +266,6 @@ def process_institution(inst, args):
     pbar.close()
     logging.info(f"  {name} 완료: {save_count:,}개 저장, {skip_count:,}개 기존, {total-save_count-skip_count:,}개 스킵")
 
-    # combined_metadata용
     df_combined = df.copy()
     if "SexDSC" in df_combined.columns and "Sex" not in df_combined.columns:
         df_combined["Sex"] = df_combined["SexDSC"]
@@ -297,15 +281,14 @@ def process_institution(inst, args):
 # ═══════════════════════════════════════════════════════════════
 def main():
     parser = argparse.ArgumentParser(description="HEEDB H5 변환")
-    parser.add_argument("--num_cpus", type=int, default=64)
-    parser.add_argument("--batch_size", type=int, default=5000)
-    parser.add_argument("--compute_beat", action="store_true", help="beat_annotation 생성")
+    parser.add_argument("--num_cpus",       type=int, default=64)
+    parser.add_argument("--batch_size",     type=int, default=5000)
+    parser.add_argument("--compute_beat",    action="store_true", help="beat_annotation 생성")
     parser.add_argument("--compute_fiducial", action="store_true", help="fiducial_point/feature 생성")
-    parser.add_argument("--compute_quality", action="store_true", default=True)
-    parser.add_argument("--no_quality", action="store_true", help="signal_quality 끄기")
+    # 신호 품질은 기본 비활성화 — 필요 시 append_signal_quality.py 사용
+    parser.add_argument("--compute_quality", action="store_true",
+                        help="신호 품질 계산 (기본 OFF; 별도로 append_signal_quality.py 권장)")
     args = parser.parse_args()
-    if args.no_quality:
-        args.compute_quality = False
 
     log_path = os.path.join(OUTPUT_ROOT, "conversion.log")
     os.makedirs(OUTPUT_ROOT, exist_ok=True)
@@ -315,15 +298,15 @@ def main():
         format="%(asctime)s [%(levelname)s] %(message)s",
         handlers=[logging.FileHandler(log_path, encoding="utf-8"), logging.StreamHandler()],
     )
+    if args.compute_quality:
+        logging.warning("--compute_quality 는 변환 속도를 크게 낮춥니다. append_signal_quality.py 사용을 권장합니다.")
     logging.info(f"출력: {OUTPUT_ROOT}")
     logging.info(f"옵션: beat={args.compute_beat}, fiducial={args.compute_fiducial}, quality={args.compute_quality}")
 
     ray.init(num_cpus=args.num_cpus, ignore_reinit_error=True)
     logging.info(f"Ray CPUs: {ray.available_resources().get('CPU', 'N/A')}")
 
-    all_csv = []
-    all_fn = []
-    all_combined = []
+    all_csv, all_fn, all_combined = [], [], []
 
     for inst in INSTITUTIONS:
         csv_rows, fn_rows, combined_df = process_institution(inst, args)
@@ -333,7 +316,7 @@ def main():
 
     ray.shutdown()
 
-    logging.info(f"\nCSV 저장 중...")
+    logging.info("CSV 저장 중...")
 
     table_path = os.path.join(OUTPUT_ROOT, "heedb_table.csv")
     pd.DataFrame(all_csv).to_csv(table_path, index=False)
@@ -348,7 +331,8 @@ def main():
     combined.to_csv(combined_path, index=False)
     logging.info(f"  combined_metadata.csv: {len(combined):,}행")
 
-    logging.info(f"\n전체 완료: H5 {len(all_csv):,}개, CSV 3개")
+    logging.info(f"전체 완료: H5 {len(all_csv):,}개, CSV 3개")
+    logging.info(f"신호 품질 계산: python append_signal_quality.py --csv {table_path} --h5_root {OUTPUT_ROOT}")
 
 
 if __name__ == "__main__":

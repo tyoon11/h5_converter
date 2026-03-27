@@ -3,3 +3,4 @@ append_corr.py
 test_record.h5
 __pycache__
 .ipynb_checkpoints
+temp/*
