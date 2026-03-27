@@ -1,411 +1,387 @@
-# HEEDB H5 Converter
+# ECG H5 변환 파이프라인
 
-WFDB 포맷의 HEEDB 원본 ECG 데이터를 HDF5(`.h5`) 파일로 변환하는 파이프라인입니다.  
-I0001(MGH)과 I0006(EUH) 두 기관의 데이터를 병렬로 처리하며, 변환 결과와 함께 학습용 CSV 테이블을 자동으로 생성합니다.
+공개 ECG 데이터셋을 내부 표준 H5 포맷으로 변환하는 파이프라인입니다.
+HEEDB와 그 외 12개 공개 데이터셋을 동일한 H5 구조로 통일합니다.
 
 ---
 
-## 디렉토리 구조
+## 프로젝트 구조
 
 ```
-convert_raw_to_h5/
-├── convert_to_h5_heedb.py        # 메인 변환 스크립트 (Ray 병렬 처리)
-├── create_h5_structure_heedb.py  # H5 내부 구조 정의 및 저장 함수
-├── utils_heedb.py                # 신호 처리 유틸리티 (피듀셜, 품질 지표 등)
-├── verify_h5.py                  # 변환 결과 검증 스크립트
-└── test_convert.py               # 단일 레코드 변환 테스트
+project/
+├── heedb/                            # HEEDB 전용 파이프라인
+│   ├── convert_to_h5_heedb.py        #   메인 변환 스크립트
+│   ├── create_h5_structure_heedb.py  #   H5 구조 생성 함수 (public과 공유)
+│   ├── utils_heedb.py                #   신호 처리 유틸리티 (public과 공유)
+│   ├── test_convert.py               #   단일 레코드 변환 테스트
+│   ├── verify_h5.py                  #   H5 검증 스크립트
+│   └── README.md                     #   HEEDB 파이프라인 상세 문서
+│
+├── convert_to_h5_public.py           # 공개 데이터셋 변환 스크립트
+├── test_convert_public.py            # 공개 데이터셋 단일 레코드 변환 테스트
+├── verify_h5_public.py               # 공개 데이터셋 H5 검증 스크립트
+├── append_signal_quality.py          # 신호 품질 계산 후 CSV에 추가
+└── README.md                         # 이 파일
 ```
 
-### 원본 데이터 구조 (변환 전)
+---
+
+## 지원 데이터셋
+
+### HEEDB
+
+| 기관 코드 | 출처 | prefix | 규모 |
+|-----------|------|--------|------|
+| I0001 | MGH (Massachusetts General Hospital) | `he1` | ~10.6M ECG |
+| I0006 | EUH (Emory University Hospital) | `he6` | ~1.0M ECG |
+
+자세한 내용은 [`heedb/README.md`](heedb/README.md) 참조.
+
+### 공개 데이터셋
+
+| 키 | 데이터셋 | prefix | fs | 리드 수 |
+|----|----------|--------|----|---------|
+| `ptb_xl` | PTB-XL | `px` | 500 Hz | 12 |
+| `ptb` | PTB | `pt` | 1000 Hz | 12 (15채널 중) |
+| `sph` | SPH | `sp` | 500 Hz | 12 |
+| `echonext` | EchoNext | `en` | 250 Hz | 12 |
+| `zzu_pecg` | ZZU pECG | `zz` | 500 Hz | 12 |
+| `code15` | CODE-15% | `c1` | 400 Hz | 8 → 12 * |
+| `chapman` | Chapman | `ch` | 500 Hz | 12 |
+| `cpsc2018` | CPSC 2018 | `cs` | 500 Hz | 12 |
+| `cpsc_extra` | CPSC-Extra | `ce` | 500 Hz | 12 |
+| `georgia` | Georgia | `ge` | 500 Hz | 12 |
+| `ningbo` | Ningbo | `nb` | 500 Hz | 12 |
+| `mimic` | MIMIC-IV-ECG | `mi` | 500 Hz | 12 |
+
+\* CODE-15%는 I, II, V1–V6 8채널만 제공. 나머지 4채널(III, aVR, aVL, aVF)은 NaN으로 저장.
+
+---
+
+## H5 파일 구조
+
+HEEDB와 공개 데이터셋 모두 동일한 구조를 사용합니다.
 
 ```
-/home/irteam/opendata1/raw/heedb/ECG/
-├── I0001/
-│   ├── metadata/
-│   │   └── metadata.csv
-│   └── WFDB/
-│       ├── S0001/{연도}/...   ← *.dat + *.hea
-│       ├── S0002/{연도}/...
-│       └── ...
-└── I0006/
+{file_name}.h5
+├── attrs
+│   ├── dataset_version           # str   "1.0"
+│   ├── file_name                 # str   고유 파일명 식별자
+│   ├── beat_ext_method           # str   "neurokit2" 또는 ""
+│   └── fidu_extract_method       # str   "neurokit2-dwt" 또는 ""
+└── ECG/
     ├── metadata/
-    │   └── metadata.csv
-    └── WFDB/
-        ├── {연도}/...        ← *.dat + *.hea
-        └── ...
+    │   ├── attrs: record_name, n_sig(=12), fs, sig_len,
+    │   │         base_time, base_date, dtype("fp16")
+    │   └── datasets: sig_name, fmt, adc_gain, baseline,
+    │                 units, adc_res, adc_zero
+    └── segments/
+        ├── attrs: seg_len
+        └── 0/
+            ├── signal             # float16, shape (12, timepoints)
+            ├── beat_annotation/   # 선택 (--compute_beat)
+            │   ├── sample         # int16, R-peak 샘플 인덱스
+            │   ├── symbol         # UTF-8
+            │   ├── subtype        # int16
+            │   ├── chan           # int16
+            │   ├── num            # int16
+            │   └── aux_note       # UTF-8
+            ├── fiducial_point/    # 선택 (--compute_fiducial)
+            │   ├── fsample        # int16, 샘플 인덱스
+            │   └── fiducial       # UTF-8, 파형 레이블
+            └── fiducial_feature/  # 선택 (--compute_fiducial)
+                └── attrs: p_amp, q_amp, r_amp, s_amp, t_amp,
+                           p_dur, pr_seg, qrs_dur, st_seg, t_dur,
+                           pr_int, qt_int, rr_int, tp_seg,
+                           qtc_baz, qtc_frid, p_axis, r_axis, t_axis
 ```
 
-### 변환 결과 구조
+### 리드 순서 (고정)
+
+```python
+TARGET_SIG_NAME = ['I', 'II', 'III', 'V1', 'V2', 'V3', 'V4', 'V5', 'V6', 'aVF', 'aVL', 'aVR']
+#  index           [ 0,   1,    2,    3,   4,   5,   6,   7,   8,    9,   10,   11 ]
+```
+
+모든 데이터셋의 리드 순서를 위 순서로 통일합니다.
+공개 데이터셋은 clinical_ts canonical 순서에서, HEEDB는 WFDB sig_name 기준으로 재정렬합니다.
+
+```
+canonical → TARGET 재정렬 인덱스: [0, 1, 2, 6, 7, 8, 9, 10, 11, 5, 4, 3]
+```
+
+---
+
+## 환경 설정
+
+```bash
+pip install wfdb h5py ray tqdm numpy pandas neurokit2 dtw-python scipy
+```
+
+공개 데이터셋 변환에는 `clinical_ts` 라이브러리가 추가로 필요합니다.
+프로젝트 루트의 `code/` 폴더에 설치하거나 `sys.path`에 추가하세요.
+
+---
+
+## 사용법
+
+### 1. 변환 전 테스트
+
+전체 변환 전에 파이프라인이 정상 동작하는지 소량의 레코드로 확인합니다.
+
+```bash
+# HEEDB — metadata.csv 500번째 행 1개 변환
+python heedb/test_convert.py
+
+# 공개 데이터셋 — 첫 3개 레코드 변환 (기본)
+python test_convert_public.py \
+    --dataset ptb_xl \
+    --dataset_dir /data/ecg_datasets \
+    --output_root /data/h5/public/v1.0
+
+# beat + fiducial 포함 테스트
+python test_convert_public.py \
+    --dataset code15 \
+    --dataset_dir /data/ecg_datasets \
+    --output_root /data/h5/public/v1.0 \
+    --n 2 --compute_beat --compute_fiducial
+```
+
+### 2. 전체 변환
+
+```bash
+# HEEDB — 신호만 저장 (기본, 가장 빠름)
+python heedb/convert_to_h5_heedb.py --num_cpus 64
+
+# HEEDB — beat + fiducial 포함
+python heedb/convert_to_h5_heedb.py --num_cpus 64 --compute_beat --compute_fiducial
+
+# 공개 데이터셋 — 단일
+python convert_to_h5_public.py \
+    --dataset_dir /data/ecg_datasets \
+    --output_root /data/h5/public/v1.0 \
+    --dataset ptb_xl \
+    --num_cpus 32
+
+# 공개 데이터셋 — 여러 개 (쉼표 구분)
+python convert_to_h5_public.py \
+    --dataset_dir /data/ecg_datasets \
+    --output_root /data/h5/public/v1.0 \
+    --dataset ptb_xl,sph,mimic \
+    --num_cpus 32
+
+# 공개 데이터셋 — 전체
+python convert_to_h5_public.py \
+    --dataset_dir /data/ecg_datasets \
+    --output_root /data/h5/public/v1.0 \
+    --dataset all \
+    --num_cpus 32
+```
+
+변환은 **증분 방식**으로 동작합니다. 이미 존재하는 H5 파일은 건너뛰므로 중단 후 재실행해도 안전합니다.
+
+### 3. 검증
+
+```bash
+# HEEDB — 단일 파일 상세 검증
+python heedb/verify_h5.py --file /data/h5/heedb/v4.0/data/he1123450.h5
+
+# HEEDB — 폴더 샘플 검증
+python heedb/verify_h5.py --dir /data/h5/heedb/v4.0/data --sample 200
+
+# 공개 데이터셋 — 단일 파일 상세 검증
+python verify_h5_public.py --file /data/h5/public/v1.0/data/ptb_xl/px12345_0.h5
+
+# 공개 데이터셋 — 특정 폴더 샘플 검증
+python verify_h5_public.py --dir /data/h5/public/v1.0/data/ptb_xl --sample 200
+
+# 공개 데이터셋 — output_root 전체 일괄 검증 (데이터셋별 결과 표 출력)
+python verify_h5_public.py --output_root /data/h5/public/v1.0 --sample 200
+
+# 공개 데이터셋 — 특정 데이터셋만 선택해 검증
+python verify_h5_public.py \
+    --output_root /data/h5/public/v1.0 \
+    --dataset ptb_xl,mimic --sample 100
+```
+
+### 4. 신호 품질 계산 (변환 후 별도 실행)
+
+신호 품질은 변환 속도 유지를 위해 변환 스크립트와 분리되어 있습니다.
+변환 완료 후 아래 스크립트로 CSV에 품질 컬럼을 추가합니다.
+
+```bash
+# HEEDB
+python append_signal_quality.py \
+    --csv  /data/h5/heedb/v4.0/heedb_table.csv \
+    --h5_root /data/h5/heedb/v4.0 \
+    --num_cpus 64 \
+    --backup
+
+# 공개 데이터셋 전체
+python append_signal_quality.py \
+    --csv  /data/h5/public/v1.0/public_ecg_table.csv \
+    --h5_root /data/h5/public/v1.0 \
+    --num_cpus 32
+
+# 특정 데이터셋만
+python append_signal_quality.py \
+    --csv  /data/h5/public/v1.0/public_ecg_table.csv \
+    --h5_root /data/h5/public/v1.0 \
+    --dataset ptb_xl,sph \
+    --num_cpus 32
+
+# DTW 생략 (속도 우선, bs_dtw = NaN)
+python append_signal_quality.py \
+    --csv  /data/h5/public/v1.0/public_ecg_table.csv \
+    --h5_root /data/h5/public/v1.0 \
+    --no_dtw --num_cpus 64
+```
+
+---
+
+## 출력 파일
+
+### HEEDB
 
 ```
 /home/irteam/opendata1/h5/heedb/v4.0/
 ├── data/
-│   ├── he1{pid}{rid}.h5
-│   ├── he6{pid}{rid}.h5
+│   ├── he1{pid}{rid}.h5       # I0001 H5 파일
+│   └── he6{pid}{rid}.h5       # I0006 H5 파일
+├── heedb_table.csv            # 학습용 메타 테이블
+├── file_name.csv              # 원본 ↔ H5 파일명 매핑
+├── combined_metadata.csv      # 양 기관 원본 메타데이터 통합
+└── conversion.log
+```
+
+### 공개 데이터셋
+
+```
+/data/h5/public/v1.0/
+├── data/
+│   ├── ptb_xl/     px{pid}_{rid}.h5
+│   ├── ptb/        pt{pid}_{rid}.h5
+│   ├── sph/        sp{pid}_{rid}.h5
 │   └── ...
-├── heedb_table.csv       # 학습용 메인 테이블
-├── file_name.csv         # 원본↔H5 파일 경로 매핑
-├── combined_metadata.csv # I0001 + I0006 통합 원본 메타데이터
-└── conversion.log        # 변환 로그
+├── public_ecg_table.csv       # 전체 통합 테이블
+├── ptb_xl_table.csv           # 데이터셋별 개별 테이블
+├── ptb_table.csv
+├── ...
+└── conversion_public.log
 ```
 
----
-
-## 의존성 설치
-
-```bash
-pip install h5py wfdb numpy pandas ray tqdm neurokit2 scipy dtw-python
-```
-
----
-
-## 빠른 시작
-
-### 1. 기본 실행 (신호 품질 지표만 포함)
-
-```bash
-python convert_to_h5_heedb.py
-```
-
-### 2. 옵션 지정 실행
-
-```bash
-# CPU 수 조정
-python convert_to_h5_heedb.py --num_cpus 32
-
-# R-peak 어노테이션 포함
-python convert_to_h5_heedb.py --compute_beat
-
-# 피듀셜 포인트/피처 포함 (시간 오래 걸림)
-python convert_to_h5_heedb.py --compute_fiducial
-
-# R-peak + 피듀셜 모두 포함
-python convert_to_h5_heedb.py --compute_beat --compute_fiducial
-
-# 신호 품질 지표 제외 (속도 우선)
-python convert_to_h5_heedb.py --no_quality
-```
-
----
-
-## 실행 옵션 전체 목록
-
-| 옵션 | 기본값 | 설명 |
-|---|---|---|
-| `--num_cpus` | `64` | Ray 워커 CPU 수 |
-| `--batch_size` | `5000` | 배치당 레코드 수 |
-| `--compute_beat` | `False` | R-peak 어노테이션 생성 (NeuroKit2) |
-| `--compute_fiducial` | `False` | 피듀셜 포인트/피처 생성 (NeuroKit2 DWT) |
-| `--compute_quality` | `True` | 신호 품질 지표 생성 |
-| `--no_quality` | — | `--compute_quality` 비활성화 플래그 |
-
----
-
-## 변환 파이프라인 상세
-
-```
-metadata.csv 로드
-      │
-      ▼
-레코드별 처리 (@ray.remote, 병렬)
-      │
-      ├─ 1. WFDB 로드 (wfdb.rdrecord)
-      │
-      ├─ 2. 스킵 조건 검사
-      │     ├ pid 결측 → skip
-      │     ├ n_sig ≠ 12 → skip
-      │     ├ duration < 1s → skip
-      │     ├ 채널 집합 불일치 → skip
-      │     └ zero-lead 존재 → skip
-      │
-      ├─ 3. 신호 reorder + transpose
-      │     WFDB (samples, n_sig)
-      │       → 채널 순서 고정 [I,II,III,V1..V6,aVF,aVL,aVR]
-      │       → (12, samples) float16
-      │
-      ├─ 4. [옵션] beat_annotation 추출
-      │     extract_beat_annotation(Lead II, fs)
-      │     → NeuroKit2 R-peak 검출
-      │
-      ├─ 5. [옵션] fiducial 추출
-      │     extract_fiducial(signal_reordered, fs)
-      │     → Lead II DWT 파형 분할
-      │     → 피듀셜 포인트 + 19개 피처
-      │
-      ├─ 6. [옵션] 신호 품질 계산
-      │     signal_statistics → NaN 비율, 진폭 통계 (5종)
-      │     beat_similarity   → 박동 간 상관계수, DTW 거리
-      │
-      └─ 7. H5 저장 + CSV row 반환
-            create_h5_structure(...)
-            → data/{file_name}.h5
-
-배치 완료 후
-      │
-      ├─ heedb_table.csv 저장
-      ├─ file_name.csv 저장
-      └─ combined_metadata.csv 저장
-```
-
----
-
-## 모듈별 설명
-
-### `convert_to_h5_heedb.py`
-
-메인 스크립트. Ray를 이용한 병렬 변환을 수행합니다.
-
-**주요 동작:**
-- I0001, I0006 순서대로 각 기관의 `metadata.csv` 를 읽어 전체 레코드를 처리합니다.
-- 이미 변환된 파일(`.h5` 존재)은 자동으로 건너뜁니다 — **중단 후 재시작 시 이어서 처리됩니다.**
-- `batch_size` 단위로 나누어 Ray future를 관리합니다.
-
-**기관 설정:**
-
-```python
-INSTITUTIONS = [
-    {
-        "name": "I0001",
-        "prefix": "he1",
-        "base_dir": "/home/irteam/opendata1/raw/heedb/ECG/I0001",
-        "gender_field": "SexDSC",     # I0001은 "SexDSC" 컬럼 사용
-    },
-    {
-        "name": "I0006",
-        "prefix": "he6",
-        "base_dir": "/home/irteam/opendata1/raw/heedb/ECG/I0006",
-        "gender_field": "Sex",        # I0006은 "Sex" 컬럼 사용
-    },
-]
-```
-
----
-
-### `create_h5_structure_heedb.py`
-
-H5 파일 내부 구조를 정의하고 데이터를 저장하는 함수 `create_h5_structure()` 를 제공합니다.
-
-```python
-from create_h5_structure_heedb import create_h5_structure
-
-with h5py.File("output.h5", "w") as h5f:
-    create_h5_structure(
-        h5f,
-        file_name="he1{pid}{rid}",
-        beat_ext_method="neurokit2",          # "" 이면 beat_annotation 미저장
-        fidu_extract_method="neurokit2-dwt",  # "" 이면 fiducial 미저장
-        record_name="...",
-        n_sig=12, fs=500, sig_len=5000,
-        base_time="...", base_date="...",
-        sig_name=['I','II','III','V1','V2','V3','V4','V5','V6','aVF','aVL','aVR'],
-        fmt=[...], adc_gain=[...], baseline=[...],
-        units=[...], adc_res=[...], adc_zero=[...],
-        signal=[sig_reordered],    # list of (12, samples) arrays
-        seg_len=1,
-        beat_annotation=[ba],      # None이면 미저장
-        fiducial_point=[fp],       # None이면 미저장
-        fiducial_feature=[ff],     # None이면 미저장
-    )
-```
-
----
-
-### `utils_heedb.py`
-
-신호 처리 핵심 함수 모음입니다.
-
-#### `reorder_signal(signal, actual_sig_name)`
-
-WFDB 로드 후 채널 순서를 고정 순서로 재배열합니다.
-
-```python
-# signal: (samples, n_leads) ← WFDB 기본 shape
-# 반환: (12, samples) float16 ← H5 저장용
-sig_reordered = reorder_signal(rec.p_signal, rec.sig_name)
-```
-
-#### `has_zero_lead(signal)`
-
-전체 값이 0인 채널이 있으면 `True` 를 반환합니다. 변환 스킵 조건으로 사용됩니다.
-
-```python
-# signal: (samples, n_leads)
-if has_zero_lead(sig):
-    return None  # skip
-```
-
-#### `signal_statistics(signal)`
-
-채널별 신호 품질 통계를 계산합니다.
-
-```python
-# signal: (samples, n_leads) ← transpose 후 전달
-stats = signal_statistics(sig_reordered.T)
-# 반환: {nan_ratio, amp_mean, amp_std, amp_skewness, amp_kurtosis}
-# 각 값은 길이 12의 리스트
-```
-
-#### `beat_similarity(signal, sampling_rate)`
-
-채널별 인접 박동 간 유사도를 계산합니다.
-
-```python
-bs = beat_similarity(sig_reordered.T, sampling_rate=500)
-# 반환: {bs_corr, bs_dtw}
-# bs_corr: Pearson 상관계수 평균 (1에 가까울수록 규칙적)
-# bs_dtw:  정규화 DTW 거리 평균 (0에 가까울수록 규칙적)
-```
-
-#### `extract_beat_annotation(signal_lead2, sampling_rate)`
-
-Lead II 신호에서 R-peak를 검출합니다.
-
-```python
-ba = extract_beat_annotation(sig_reordered[1], fs=500)
-# 반환: {sample, symbol, subtype, chan, num, aux_note}
-```
-
-#### `extract_fiducial(signal_reordered, sampling_rate)`
-
-Lead II 기준 DWT 파형 분할로 피듀셜 포인트와 19개 피처를 추출합니다.  
-전기 축은 Lead I 과 Lead II 를 함께 사용합니다.
-
-```python
-# signal_reordered: (12, samples), 채널 순서 고정 필수
-fp, ff = extract_fiducial(sig_reordered, fs=500)
-# fp: {fsample: [...], fiducial: [...]}
-# ff: {p_amp, q_amp, r_amp, s_amp, t_amp, p_dur, ...} float16 dict
-```
-
----
-
-### `verify_h5.py`
-
-변환 결과를 검증하는 스크립트입니다.
-
-**단일 파일 상세 확인:**
-
-```bash
-python verify_h5.py --file data/he110745030.h5
-```
-
-루트 속성, 메타데이터, 신호 통계, 어노테이션 내용을 모두 출력합니다.
-
-**폴더 전체 일괄 검증:**
-
-```bash
-# 전체 검증
-python verify_h5.py --dir /home/irteam/opendata1/h5/heedb/v4.0/data
-
-# 샘플 100개만 무작위 검증
-python verify_h5.py --dir /home/irteam/opendata1/h5/heedb/v4.0/data --sample 100
-```
-
-검증 항목:
-
-| 항목 | 기준 |
-|---|---|
-| root attrs | `dataset_version`, `file_name` 존재 여부 |
-| metadata attrs | `record_name`, `n_sig`, `fs`, `sig_len` 존재 여부 |
-| sig_name | `['I','II','III','V1','V2','V3','V4','V5','V6','aVF','aVL','aVR']` 일치 여부 |
-| segment 존재 | `seg_len` 만큼의 세그먼트 키 존재 여부 |
-| signal shape | `signal.shape[0] == 12` |
-
----
-
-### `test_convert.py`
-
-변환 파이프라인 전체를 단일 레코드로 테스트합니다.  
-변환 → H5 저장 → 재로드 후 원본과 비교까지 수행합니다.
-
-```bash
-python test_convert.py
-```
-
-**스크립트 내 설정값:**
-
-```python
-INSTITUTION = "I0001"
-BASE_DIR = f"/home/irteam/opendata1/raw/heedb/ECG/{INSTITUTION}"
-META_PATH = os.path.join(BASE_DIR, "metadata", "metadata.csv")
-WFDB_ROOT = os.path.join(BASE_DIR, "WFDB")
-OUTPUT_H5 = "/home/irteam/tykim/convert_h5/convert_raw_to_h5/test_record.h5"
-```
-
-**검증 항목:**
-- root attrs / metadata attrs 정상 저장 여부
-- `sig_name` 일치 여부
-- `signal` shape 및 `np.allclose` 원본 비교 (atol=0.01, float16 오차 허용)
-- `beat_annotation` / `fiducial_point` / `fiducial_feature` 내용 확인
-- CSV row 미리보기 (age 정규화, gender 인코딩 등)
-
----
-
-## 신호 품질 지표 상세
-
-`--compute_quality` (기본 활성화) 시 `heedb_table.csv` 에 아래 컬럼이 추가됩니다.
+### CSV 컬럼
 
 | 컬럼 | 설명 |
-|---|---|
-| `nan_ratio` | 채널별 NaN 샘플 비율 (0.0 ~ 1.0) |
-| `amp_mean` | 채널별 진폭 평균 |
-| `amp_std` | 채널별 진폭 표준편차 |
-| `amp_skewness` | 채널별 왜도 |
-| `amp_kurtosis` | 채널별 첨도 |
-| `bs_corr` | 채널별 인접 박동 Pearson 상관계수 평균 |
-| `bs_dtw` | 채널별 인접 박동 DTW 거리 평균 (정규화) |
-
-모든 값은 길이 12의 Python 리스트를 문자열로 저장합니다.
-
-`beat_similarity` 는 R-peak 검출 후 각 박동을 `sampling_rate × 2` 길이로 리샘플링하고 z-score 정규화한 뒤 인접 박동 간 지표를 계산합니다. R-peak 가 3개 이하이면 `NaN` 입니다.
-
----
-
-## age 인코딩 규칙
-
-```python
-age = float(AgeAtAcquisition) / 365.25 / 100
-```
-
-`AgeAtAcquisition` 은 일(day) 단위로 저장된 나이입니다.  
-365.25로 나누어 연(year) 단위로 변환한 뒤, 100으로 나누어 0~1 범위로 정규화합니다.  
-변환 실패 시 `-1` 로 기록됩니다.
-
-## gender 인코딩 규칙
-
-| 원본 값 | 저장 값 |
-|---|---|
-| `"MALE"` | `1` |
-| `"FEMALE"` | `-1` |
-| 그 외 / 결측 | `0` |
-
-I0001은 `SexDSC` 컬럼, I0006은 `Sex` 컬럼을 사용합니다.
+|------|------|
+| `filepath` | H5 파일 상대 경로 (`data/{dataset}/{file_name}.h5`) |
+| `dataset` | 데이터셋 키 (공개 데이터셋만. HEEDB는 없음) |
+| `pid` | 환자 ID |
+| `rid` | 원본 메타데이터 행 인덱스 |
+| `sid` | 세그먼트 인덱스 (현재 항상 `0`) |
+| `oid` | 고유 관측 ID |
+| `age` | 나이 (years / 100, 0~1 범위) |
+| `gender` | 1=남성, -1=여성, 0=미상 |
+| `height` | cm (미제공 시 NaN) |
+| `weight` | kg (미제공 시 NaN) |
+| `fs` | 샘플링 주파수 (Hz) |
+| `channel_name` | TARGET_SIG_NAME 리스트 문자열 |
+| `nan_ratio` | *(품질 계산 후)* per-lead NaN 비율 (12개 리스트) |
+| `amp_mean` | *(품질 계산 후)* per-lead 진폭 평균 |
+| `amp_std` | *(품질 계산 후)* per-lead 진폭 표준편차 |
+| `amp_skewness` | *(품질 계산 후)* per-lead 왜도 |
+| `amp_kurtosis` | *(품질 계산 후)* per-lead 첨도 |
+| `bs_corr` | *(품질 계산 후)* per-lead beat-to-beat 상관계수 |
+| `bs_dtw` | *(품질 계산 후)* per-lead beat-to-beat DTW 거리 |
 
 ---
 
-## 자주 발생하는 문제
+## CLI 옵션 요약
 
-### H5 파일이 일부만 생성된 경우
+### `convert_to_h5_public.py`
 
-재실행하면 이미 생성된 파일은 건너뛰고 나머지를 이어서 처리합니다.
+| 옵션 | 기본값 | 설명 |
+|------|--------|------|
+| `--dataset_dir` | 필수 | 원본 데이터셋 루트 경로 |
+| `--output_root` | 필수 | H5 출력 루트 경로 |
+| `--dataset` | `all` | 변환할 데이터셋 (all / 쉼표 구분 / 단일) |
+| `--num_cpus` | `32` | Ray 병렬 CPU 수 |
+| `--batch_size` | `2000` | 배치 크기 |
+| `--compute_beat` | OFF | beat_annotation 생성 |
+| `--compute_fiducial` | OFF | fiducial_point / feature 생성 |
+| `--compute_quality` | OFF | 신호 품질 계산 (권장하지 않음) |
 
-```bash
-python convert_to_h5_heedb.py
+### `test_convert_public.py`
+
+| 옵션 | 기본값 | 설명 |
+|------|--------|------|
+| `--dataset` | 필수 | 테스트할 데이터셋 키 (예: `ptb_xl`) |
+| `--dataset_dir` | 필수 | 원본 데이터셋 루트 경로 |
+| `--output_root` | 필수 | H5 출력 루트 경로 |
+| `--n` | `3` | 테스트할 레코드 수 |
+| `--compute_beat` | OFF | beat_annotation 추출 포함 |
+| `--compute_fiducial` | OFF | fiducial_point / feature 추출 포함 |
+
+### `verify_h5_public.py`
+
+| 옵션 | 기본값 | 설명 |
+|------|--------|------|
+| `--file` | — | 단일 H5 파일 상세 검증 |
+| `--dir` | — | 특정 폴더 일괄 검증 |
+| `--output_root` | — | output_root/data/ 전체 데이터셋 일괄 검증 |
+| `--dataset` | 전체 | 검증할 데이터셋 (쉼표 구분, `--output_root` 모드) |
+| `--sample` | 전체 | 폴더당 무작위 샘플링 파일 수 |
+| `--allow_nan_leads` | OFF | 전체 NaN 리드를 오류로 취급하지 않음 |
+
+### `append_signal_quality.py`
+
+| 옵션 | 기본값 | 설명 |
+|------|--------|------|
+| `--csv` | 필수 | 대상 CSV 경로 |
+| `--h5_root` | 필수 | H5 루트 경로 |
+| `--dataset` | 전체 | 특정 데이터셋만 처리 (쉼표 구분) |
+| `--overwrite` | OFF | 이미 계산된 행 재계산 |
+| `--no_dtw` | OFF | DTW 생략 (`bs_dtw = NaN`) |
+| `--num_cpus` | `32` | Ray 병렬 CPU 수 |
+| `--batch_size` | `1000` | Ray 배치 크기 |
+| `--save_interval` | `10` | N 배치마다 중간 저장 (0이면 최종 1회만) |
+| `--backup` | OFF | 처리 전 원본 CSV를 `.backup.csv` 로 백업 |
+
+---
+
+## 권장 실행 순서
+
+```
+1. 변환 테스트      python heedb/test_convert.py
+                    python test_convert_public.py \
+                        --dataset ptb_xl \
+                        --dataset_dir /data/raw \
+                        --output_root /data/h5/public/v1.0
+
+2. 전체 변환        python heedb/convert_to_h5_heedb.py --num_cpus 64
+                    python convert_to_h5_public.py \
+                        --dataset_dir /data/raw \
+                        --output_root /data/h5/public/v1.0 \
+                        --dataset all --num_cpus 32
+
+3. 검증             python heedb/verify_h5.py \
+                        --dir /data/h5/heedb/v4.0/data --sample 500
+                    python verify_h5_public.py \
+                        --output_root /data/h5/public/v1.0 --sample 200
+
+4. 신호 품질 계산   python append_signal_quality.py \
+                        --csv /data/h5/heedb/v4.0/heedb_table.csv \
+                        --h5_root /data/h5/heedb/v4.0 --num_cpus 64
+                    python append_signal_quality.py \
+                        --csv /data/h5/public/v1.0/public_ecg_table.csv \
+                        --h5_root /data/h5/public/v1.0 --num_cpus 32
 ```
 
-### `sig_name mismatch` 검증 오류
+---
 
-원본 WFDB 레코드의 채널 집합이 12 표준 유도와 다릅니다. 변환 시 이미 스킵 처리되므로 H5 파일에는 영향 없습니다.
+## 주의 사항
 
-### `beat_annotation` / `fiducial_feature` 가 H5에 없음
-
-`--compute_beat` / `--compute_fiducial` 옵션 없이 변환된 파일입니다.  
-해당 옵션을 추가하여 재변환하거나, 별도 후처리 스크립트로 추가 저장이 필요합니다.
-
-### Ray 메모리 오류
-
-`--batch_size` 를 줄이거나 `--num_cpus` 를 낮추어 재시도합니다.
-
-```bash
-python convert_to_h5_heedb.py --num_cpus 16 --batch_size 1000
-```
+- **신호 품질 계산은 변환과 분리**합니다. 변환 스크립트의 `--compute_quality` 옵션은 속도 저하가 크므로 `append_signal_quality.py` 사용을 권장합니다.
+- `append_signal_quality.py` 는 **재개(Resume)를 지원**합니다. `nan_ratio` 컬럼이 비어있는 행만 계산하므로 중단 후 재실행해도 안전합니다.
+- **CODE-15%** 는 III, aVR, aVL, aVF 4개 리드가 NaN입니다. `verify_h5_public.py` 는 해당 폴더명을 자동 감지해 NaN 리드를 허용합니다. 모델 학습 시에는 별도 마스킹 처리가 필요합니다.
+- 공개 데이터셋 변환은 `clinical_ts` 라이브러리에 의존합니다. `code/` 폴더에 설치되어 있어야 합니다.
