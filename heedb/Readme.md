@@ -90,8 +90,6 @@ TARGET_SIG_NAME = ['I', 'II', 'III', 'V1', 'V2', 'V3', 'V4', 'V5', 'V6', 'aVF', 
 #  index           [ 0,   1,    2,    3,   4,   5,   6,   7,   8,    9,   10,   11 ]
 ```
 
-원본 WFDB의 리드 순서와 무관하게 `reorder_signal()`이 위 순서로 재정렬한 뒤 `(12, timepoints)`로 저장합니다.
-
 ---
 
 ## 출력 파일
@@ -109,26 +107,26 @@ TARGET_SIG_NAME = ['I', 'II', 'III', 'V1', 'V2', 'V3', 'V4', 'V5', 'V6', 'aVF', 
 
 ### `heedb_table.csv` 컬럼
 
-| 컬럼 | 설명 |
-|------|------|
-| `filepath` | `data/{file_name}.h5` 상대 경로 |
-| `pid` | BDSPPatientID |
-| `rid` | metadata.csv 행 인덱스 |
-| `sid` | 세그먼트 인덱스 (현재 항상 0) |
-| `oid` | 고유 관측 ID (`{prefix}{pid}{rid}{sid}`) |
-| `age` | 나이 (AgeAtAcquisition 일 수 → years / 100, 0~1 범위) |
-| `gender` | 1=남성, -1=여성, 0=미상 |
-| `height` | NaN (미제공) |
-| `weight` | NaN (미제공) |
-| `fs` | 샘플링 주파수 (Hz) |
-| `channel_name` | TARGET_SIG_NAME 리스트 문자열 |
-| `nan_ratio` | *(품질 계산 후)* per-lead NaN 비율 |
-| `amp_mean` | *(품질 계산 후)* per-lead 진폭 평균 |
-| `amp_std` | *(품질 계산 후)* per-lead 진폭 표준편차 |
-| `amp_skewness` | *(품질 계산 후)* per-lead 왜도 |
-| `amp_kurtosis` | *(품질 계산 후)* per-lead 첨도 |
-| `bs_corr` | *(품질 계산 후)* per-lead beat-to-beat 상관계수 |
-| `bs_dtw` | *(품질 계산 후)* per-lead beat-to-beat DTW 거리 |
+| 컬럼 | 시점 | 설명 |
+|------|------|------|
+| `filepath` | 변환 시 | `data/{file_name}.h5` 상대 경로 |
+| `pid` | 변환 시 | BDSPPatientID |
+| `rid` | 변환 시 | metadata.csv 행 인덱스 |
+| `sid` | 변환 시 | 세그먼트 인덱스 (항상 0) |
+| `oid` | 변환 시 | 고유 관측 ID (`{prefix}{pid}{rid}{sid}`) |
+| `age` | 변환 시 | 나이 (AgeAtAcquisition 일 수 → years / 100, 0~1 범위) |
+| `gender` | 변환 시 | 1=남성, -1=여성, 0=미상 |
+| `height` | 변환 시 | NaN (미제공) |
+| `weight` | 변환 시 | NaN (미제공) |
+| `fs` | 변환 시 | 샘플링 주파수 (Hz) |
+| `channel_name` | 변환 시 | TARGET_SIG_NAME 리스트 문자열 |
+| `nan_ratio` | **변환 시** | per-lead NaN 비율 |
+| `amp_mean` | **변환 시** | per-lead 진폭 평균 |
+| `amp_std` | **변환 시** | per-lead 진폭 표준편차 |
+| `amp_skewness` | **변환 시** | per-lead 왜도 |
+| `amp_kurtosis` | **변환 시** | per-lead 첨도 |
+| `bs_corr` | **별도 계산** | per-lead beat-to-beat 상관계수 |
+| `bs_dtw` | **별도 계산** | per-lead beat-to-beat DTW 거리 |
 
 ---
 
@@ -142,8 +140,6 @@ pip install wfdb h5py ray tqdm numpy pandas neurokit2 dtw-python scipy
 
 ### 1. 단일 레코드 테스트
 
-전체 변환 전에 파이프라인 전체가 동작하는지 확인합니다.
-
 ```bash
 # 프로젝트 루트에서 실행
 python heedb/test_convert.py
@@ -153,8 +149,10 @@ python heedb/test_convert.py
 
 ### 2. 전체 변환
 
+변환 시 `signal_statistics` (nan_ratio, amp_*)를 **기본으로 함께 계산**합니다.
+
 ```bash
-# 신호 저장만 (beat/fiducial 제외, 가장 빠름)
+# 신호 저장 + signal_statistics (기본)
 python heedb/convert_to_h5_heedb.py --num_cpus 64
 
 # beat annotation 포함
@@ -162,9 +160,10 @@ python heedb/convert_to_h5_heedb.py --num_cpus 64 --compute_beat
 
 # beat + fiducial 포함
 python heedb/convert_to_h5_heedb.py --num_cpus 64 --compute_beat --compute_fiducial
-```
 
-신호 품질(signal quality)은 기본적으로 계산하지 않습니다. 변환 완료 후 별도 스크립트로 계산합니다.
+# signal_statistics 생략 (변환만)
+python heedb/convert_to_h5_heedb.py --num_cpus 64 --no_stats
+```
 
 ### 3. 검증
 
@@ -176,7 +175,9 @@ python heedb/verify_h5.py --file /home/irteam/opendata1/h5/heedb/v4.0/data/he112
 python heedb/verify_h5.py --dir /home/irteam/opendata1/h5/heedb/v4.0/data --sample 200
 ```
 
-### 4. 신호 품질 계산 (별도)
+### 4. beat_similarity 계산 (별도)
+
+`bs_corr` / `bs_dtw` 는 계산 비용이 크므로 변환 완료 후 따로 실행합니다.
 
 ```bash
 # 프로젝트 루트에서 실행
@@ -193,11 +194,11 @@ python append_signal_quality.py \
     --no_dtw --num_cpus 64
 ```
 
+`append_signal_quality.py`는 `bs_corr` 컬럼이 비어있는 행만 처리하므로 중단 후 재실행해도 안전합니다.
+
 ---
 
 ## 스킵 조건
-
-아래 조건에 해당하는 레코드는 변환을 건너뜁니다.
 
 | 조건 | 이유 |
 |------|------|
@@ -226,8 +227,8 @@ HEEDB와 공개 데이터셋 파이프라인이 이 함수를 공유합니다.
 | `has_zero_lead(signal)` | `(T, N)` | `bool` | 전체 0인 리드 존재 여부 |
 | `extract_beat_annotation(signal_lead2, fs)` | `1D array`, `int` | `dict` | neurokit2 R-peak 검출 |
 | `extract_fiducial(signal_reordered, fs)` | `(12, T)`, `int` | `(dict, dict)` | P/Q/R/S/T 파형 위치 + 측정값 |
-| `signal_statistics(signal)` | `(T, 12)` | `dict` | per-lead NaN 비율, 진폭 통계 |
-| `beat_similarity(signal, fs)` | `(T, 12)`, `int` | `dict` | per-lead beat-to-beat 상관계수 + DTW |
+| `signal_statistics(signal)` | `(T, 12)` | `dict` | per-lead NaN 비율, 진폭 통계 — **변환 시 기본 계산** |
+| `beat_similarity(signal, fs)` | `(T, 12)`, `int` | `dict` | per-lead beat-to-beat 상관계수 + DTW — **별도 계산** |
 
 ---
 
@@ -239,4 +240,4 @@ HEEDB와 공개 데이터셋 파이프라인이 이 함수를 공유합니다.
 | `--batch_size` | `5000` | 배치 크기 |
 | `--compute_beat` | OFF | beat_annotation 생성 |
 | `--compute_fiducial` | OFF | fiducial_point / feature 생성 |
-| `--compute_quality` | OFF | 신호 품질 계산 (권장하지 않음) |
+| `--no_stats` | OFF | signal_statistics 계산 생략 (기본은 계산) |
