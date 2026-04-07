@@ -1,5 +1,7 @@
 """
-HEEDB H5 구조 생성 함수
+H5 구조 생성 함수
+==================
+모든 데이터셋(HEEDB, PhysioNet, ZZU)이 공유하는 표준 H5 파일 구조를 생성합니다.
 """
 
 import h5py
@@ -28,6 +30,20 @@ def create_h5_structure(
     signal=None, seg_len=1,
     beat_annotation=None, fiducial_point=None, fiducial_feature=None,
 ):
+    """
+    표준 H5 파일 구조를 생성합니다.
+
+    구조:
+      root attrs: dataset_version, file_name, beat_ext_method, fidu_extract_method
+      ECG/
+        metadata/  (attrs + datasets)
+        segments/
+          0/
+            signal            (12, T) float16
+            beat_annotation/  (선택)
+            fiducial_point/   (선택)
+            fiducial_feature/ (선택)
+    """
     # root attrs
     h5_file.attrs["dataset_version"] = dataset_version
     h5_file.attrs["file_name"] = file_name
@@ -76,20 +92,27 @@ def create_h5_structure(
             ba_grp = s_grp.create_group("beat_annotation")
             samples = np.array(ba.get("sample", []), dtype=np.int16)
             nb = len(samples)
-            ba_grp.create_dataset("sample", data=samples)
-            ba_grp.create_dataset("symbol", data=np.array(ba.get("symbol", [""]*nb), dtype=UTF8), dtype=UTF8)
-            ba_grp.create_dataset("subtype", data=np.array(ba.get("subtype", np.zeros(nb)), dtype=np.int16))
-            ba_grp.create_dataset("chan", data=np.array(ba.get("chan", np.zeros(nb)), dtype=np.int16))
-            ba_grp.create_dataset("num", data=np.array(ba.get("num", np.zeros(nb)), dtype=np.int16))
-            ba_grp.create_dataset("aux_note", data=np.array(ba.get("aux_note", [""]*nb), dtype=UTF8), dtype=UTF8)
+            ba_grp.create_dataset("sample",   data=samples)
+            ba_grp.create_dataset("symbol",   data=np.array(ba.get("symbol",   [""]*nb), dtype=UTF8), dtype=UTF8)
+            ba_grp.create_dataset("subtype",  data=np.array(ba.get("subtype",  np.zeros(nb)), dtype=np.int16))
+            ba_grp.create_dataset("chan",      data=np.array(ba.get("chan",     np.zeros(nb)), dtype=np.int16))
+            ba_grp.create_dataset("num",       data=np.array(ba.get("num",      np.zeros(nb)), dtype=np.int16))
+            ba_grp.create_dataset("aux_note",  data=np.array(ba.get("aux_note", [""]*nb), dtype=UTF8), dtype=UTF8)
 
         if fiducial_point is not None and i < len(fiducial_point):
             fp = fiducial_point[i]
-            fp_grp = s_grp.create_group("fiducial_point")
-            fs_arr = fp.get("fsample", [])
+            fp_grp  = s_grp.create_group("fiducial_point")
+            fs_arr  = fp.get("fsample",  [])
             fid_arr = fp.get("fiducial", [])
-            fp_grp.create_dataset("fsample", data=np.array(fs_arr, dtype=np.int16) if len(fs_arr) else np.array([], dtype=np.int16))
-            fp_grp.create_dataset("fiducial", data=np.array(fid_arr, dtype=UTF8) if len(fid_arr) else np.array([], dtype=UTF8), dtype=UTF8)
+            fp_grp.create_dataset(
+                "fsample",
+                data=np.array(fs_arr,  dtype=np.int16) if len(fs_arr)  else np.array([], dtype=np.int16),
+            )
+            fp_grp.create_dataset(
+                "fiducial",
+                data=np.array(fid_arr, dtype=UTF8)    if len(fid_arr) else np.array([], dtype=UTF8),
+                dtype=UTF8,
+            )
 
         if fiducial_feature is not None and i < len(fiducial_feature):
             ff = fiducial_feature[i]

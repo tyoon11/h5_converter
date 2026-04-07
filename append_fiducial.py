@@ -53,8 +53,7 @@ import ray
 from pathlib import Path
 from tqdm import tqdm
 
-HEEDB_DIR = str(Path(__file__).resolve().parent / "heedb")
-sys.path.insert(0, HEEDB_DIR)
+SCRIPT_DIR = str(Path(__file__).resolve().parent)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -63,7 +62,7 @@ sys.path.insert(0, HEEDB_DIR)
 @ray.remote
 def append_fiducial_one(
     h5_path:       str,
-    heedb_dir:     str,
+    script_dir:    str,
     compute_beat:  bool,
     compute_fidu:  bool,
     overwrite:     bool,
@@ -75,9 +74,9 @@ def append_fiducial_one(
     import sys, os
     import numpy as np
     import h5py
-    sys.path.insert(0, heedb_dir)
-    from create_h5_structure_heedb import TARGET_SIG_NAME
-    from utils_heedb import extract_beat_annotation, extract_fiducial
+    sys.path.insert(0, script_dir)
+    from utils.h5_structure import TARGET_SIG_NAME
+    from utils.signal_processing import extract_beat_annotation, extract_fiducial
 
     UTF8 = h5py.string_dtype(encoding="utf-8")
 
@@ -258,7 +257,7 @@ def run(args):
         batch = h5_paths[b * batch_size : (b + 1) * batch_size]
         futures = [
             append_fiducial_one.remote(
-                p, HEEDB_DIR, compute_beat, compute_fidu, args.overwrite,
+                p, SCRIPT_DIR, compute_beat, compute_fidu, args.overwrite,
             )
             for p in batch
         ]

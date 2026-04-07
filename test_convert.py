@@ -1,26 +1,38 @@
 """
-공개 데이터셋 H5 변환 테스트 (데이터셋별 1개)
-=============================================
-각 데이터셋의 첫 번째 유효 레코드를 변환하고
-H5 재로드 검증까지 전체 파이프라인을 확인합니다.
+통합 변환 테스트 (데이터셋별 1개 레코드)
+==========================================
+모든 데이터셋(HEEDB + PhysioNet + ZZU)에 대해
+첫 번째 유효 레코드를 변환하고 H5 재로드 검증까지 전체 파이프라인을 확인합니다.
 
 실행:
-  # physionet 8개 테스트
-  python test_convert_public.py --group physionet \\
-      --physionet_root /home/irteam/ddn-opendata1/raw/physionet.org/files \\
-      --output_root    /tmp/h5_public_test
+  # 공개 데이터셋 전체
+  python test_convert.py --group physionet \\
+      --physionet_root /data/raw/physionet.org/files \\
+      --output_root /tmp/h5_test
 
-  # ZZU 테스트
-  python test_convert_public.py --group zzu \\
-      --zzu_root    /home/irteam/ddn-opendata1/raw/ZZU-pECG \\
-      --output_root /tmp/h5_public_test
+  # ZZU
+  python test_convert.py --group zzu \\
+      --zzu_root /data/raw/ZZU-pECG \\
+      --output_root /tmp/h5_test
+
+  # HEEDB
+  python test_convert.py --group heedb \\
+      --heedb_root /data/raw/heedb/ECG \\
+      --output_root /tmp/h5_test
+
+  # 전체
+  python test_convert.py --group all \\
+      --heedb_root /data/raw/heedb/ECG \\
+      --physionet_root /data/raw/physionet.org/files \\
+      --zzu_root /data/raw/ZZU-pECG \\
+      --output_root /tmp/h5_test
 
   # 특정 데이터셋만
-  python test_convert_public.py --dataset georgia,ptbxl \\
-      --physionet_root ... --output_root ...
+  python test_convert.py --dataset georgia,ptbxl,heedb_i0001 \\
+      --physionet_root ... --heedb_root ... --output_root ...
 
   # beat/fiducial 포함
-  python test_convert_public.py --dataset georgia \\
+  python test_convert.py --dataset ptbxl \\
       --physionet_root ... --output_root ... \\
       --compute_beat --compute_fiducial
 """
@@ -32,43 +44,37 @@ import numpy as np
 import h5py
 from pathlib import Path
 
-ROOT_DIR  = Path(__file__).resolve().parent
-HEEDB_DIR = str(ROOT_DIR / "heedb")
-sys.path.insert(0, HEEDB_DIR)
+SCRIPT_DIR = str(Path(__file__).resolve().parent)
+sys.path.insert(0, SCRIPT_DIR)
 
 import wfdb
-from create_h5_structure_heedb import create_h5_structure, TARGET_SIG_NAME
-from utils_heedb import extract_beat_annotation, extract_fiducial, signal_statistics
-from convert_to_h5_public import (
-    _build_configs, _make_table_df, _make_filename_df,
-    LEAD_ALIASES, TARGET_SET,
-    PHYSIONET_DATASETS, ZZU_DATASETS,
+from utils.h5_structure import create_h5_structure, TARGET_SIG_NAME, FIDUCIAL_FEATURE_KEYS
+from utils.signal_processing import (
+    extract_beat_annotation, extract_fiducial, signal_statistics, has_zero_lead,
+)
+from convert_to_h5 import (
+    _build_all_configs,
+    PHYSIONET_DATASETS, ZZU_DATASETS, HEEDB_DATASETS,
+    LEAD_ALIASES,
 )
 
-FIDUCIAL_FEATURE_KEYS = [
-    "p_amp", "q_amp", "r_amp", "s_amp", "t_amp",
-    "p_dur", "pr_seg", "qrs_dur", "st_seg", "t_dur",
-    "pr_int", "qt_int", "rr_int", "tp_seg",
-    "qtc_baz", "qtc_frid", "p_axis", "r_axis", "t_axis",
-]
-P = "✅"
-F = "❌"
-W = "⚠️ "
+TARGET_SET = set(TARGET_SIG_NAME)
+PASS = "OK"
+FAIL = "FAIL"
+WARN = "WARN"
 
 
 # ═══════════════════════════════════════════════════════════════
-# 첫 번째 유효 레코드 탐색
+# 유효 레코드 탐색
 # ═══════════════════════════════════════════════════════════════
-def _find_valid(records: list, max_try: int = 10) -> tuple:
-    """유효한 (rec, sig, d, raw_names, rec_info) 반환. 없으면 None."""
+def _find_valid(records: list, max_try: int = 20):
+    """유효한 레코드를 탐색합니다. 없으면 None 반환."""
     for rec_info in records[:max_try]:
         try:
             rec = wfdb.rdrecord(rec_info["record_path"])
         except Exception:
             continue
-        sig = rec.p_signal
-        if sig is None:
-            sig = rec.d_signal
+        sig = rec.p_signal if rec.p_signal is not None else rec.d_signal
         if sig is None:
             continue
         d         = rec.__dict__
@@ -76,7 +82,7 @@ def _find_valid(records: list, max_try: int = 10) -> tuple:
         if (d["n_sig"] != 12
                 or set(raw_names) != TARGET_SET
                 or sig.shape[0] / d["fs"] < 1.0
-                or np.any(np.all(sig == 0, axis=0))):
+                or has_zero_lead(sig)):
             continue
         return rec, sig, d, raw_names, rec_info
     return None
@@ -86,60 +92,58 @@ def _find_valid(records: list, max_try: int = 10) -> tuple:
 # 단일 데이터셋 테스트
 # ═══════════════════════════════════════════════════════════════
 def test_one(dataset_name: str, cfg: dict, output_root: Path, args) -> dict:
-    prefix  = cfg["prefix"]
-    # flat: 모든 데이터셋을 data/ 아래 같은 폴더에 저장
-    h5_dir  = output_root / "data"
+    prefix = cfg["prefix"]
+    h5_dir = output_root / "data"
     os.makedirs(h5_dir, exist_ok=True)
 
     print(f"\n{'='*60}")
-    print(f"  [{cfg['name']}]  prefix={prefix}")
+    print(f"  [{dataset_name}]  prefix={prefix}")
     print(f"{'='*60}")
 
-    # ── 1. 레코드 목록 ───────────────────────────────────────
-    print("[1] 레코드 목록")
+    # 1. 레코드 목록
+    print("[1] 레코드 목록 로드")
     try:
         records = cfg["records_fn"]()
     except Exception as e:
-        print(f"  {F} 실패: {e}")
-        return {"dataset": dataset_name, "status": "FAIL", "reason": str(e)}
+        print(f"  [{FAIL}] {e}")
+        return {"dataset": dataset_name, "status": FAIL, "reason": str(e)}
+    if not records:
+        print(f"  [{FAIL}] 레코드 없음 (경로 확인 필요)")
+        return {"dataset": dataset_name, "status": FAIL, "reason": "no records"}
     print(f"  전체: {len(records):,}개")
 
-    # ── 2. 유효 레코드 탐색 ──────────────────────────────────
-    print("[2] 유효 레코드 탐색 (최대 10개 시도)")
+    # 2. 유효 레코드 탐색
+    print("[2] 유효 레코드 탐색 (최대 20개 시도)")
     found = _find_valid(records)
     if found is None:
-        print(f"  {F} 유효 레코드 없음")
-        return {"dataset": dataset_name, "status": "FAIL", "reason": "no valid record"}
+        print(f"  [{FAIL}] 유효 레코드 없음")
+        return {"dataset": dataset_name, "status": FAIL, "reason": "no valid record"}
     rec, sig, d, raw_names, rec_info = found
 
     fs      = d["fs"]
     sig_len = d["sig_len"]
-    print(f"  record_path  : {rec_info['record_path']}")
-    print(f"  pid / rid    : {rec_info['pid']} / {rec_info['rid']}")
-    print(f"  fs           : {fs} Hz")
-    print(f"  shape        : {sig.shape}  ({sig.shape[0]/fs:.1f}s)")
-    print(f"  leads (norm) : {raw_names}")
-    print(f"  age / gender : {rec_info['age']} / {rec_info['gender']}")
+    print(f"  record_path : {rec_info['record_path']}")
+    print(f"  pid / rid   : {rec_info['pid']} / {rec_info['rid']}")
+    print(f"  fs          : {fs} Hz  |  duration: {sig.shape[0]/fs:.1f}s")
+    print(f"  leads       : {raw_names}")
 
-    # ── 3. Reorder ───────────────────────────────────────────
+    # 3. Reorder → (12, samples) fp16
     print("[3] Reorder → (12, samples) fp16")
     idx           = [raw_names.index(n) for n in TARGET_SIG_NAME]
     sig_reordered = sig[:, idx].T.astype(np.float16)
     sig_f32       = sig_reordered.astype(np.float32)
     nan_leads     = int(np.sum(np.all(np.isnan(sig_f32), axis=1)))
-    print(f"  shape        : {sig_reordered.shape}  dtype={sig_reordered.dtype}")
-    print(f"  값 범위      : min={np.nanmin(sig_f32):.4f}  max={np.nanmax(sig_f32):.4f}")
-    print(f"  전체NaN 리드 : {nan_leads}/12")
+    print(f"  shape: {sig_reordered.shape}  NaN 리드: {nan_leads}/12")
 
-    # ── 4. signal_statistics ─────────────────────────────────
+    # 4. signal_statistics
     print("[4] signal_statistics")
     try:
         stats = signal_statistics(sig_f32.T)
-        print(f"  amp_std  : {[f'{v:.3f}' for v in stats['amp_std']]}")
+        print(f"  amp_std: {[round(v, 3) for v in stats['amp_std']]}")
     except Exception as e:
-        print(f"  {W} {e}")
+        print(f"  [{WARN}] {e}")
 
-    # ── 5. beat_annotation (옵션) ────────────────────────────
+    # 5. beat_annotation (옵션)
     ba_list, beat_method = None, ""
     if args.compute_beat:
         print("[5] beat_annotation")
@@ -147,11 +151,11 @@ def test_one(dataset_name: str, cfg: dict, output_root: Path, args) -> dict:
             ba          = extract_beat_annotation(np.nan_to_num(sig_f32[1]), fs)
             ba_list     = [ba]
             beat_method = "neurokit2"
-            print(f"  R-peaks  : {len(ba['sample'])}개  {P}")
+            print(f"  R-peaks: {len(ba['sample'])}개  [{PASS}]")
         except Exception as e:
-            print(f"  {W} {e}")
+            print(f"  [{WARN}] {e}")
 
-    # ── 6. fiducial (옵션) ───────────────────────────────────
+    # 6. fiducial (옵션)
     fp_list, ff_list, fidu_method = None, None, ""
     if args.compute_fiducial:
         print("[6] fiducial")
@@ -162,16 +166,14 @@ def test_one(dataset_name: str, cfg: dict, output_root: Path, args) -> dict:
             fidu_method = "neurokit2-dwt"
             nan_cnt     = sum(1 for v in ff.values()
                               if isinstance(v, (float, np.floating)) and np.isnan(v))
-            print(f"  points   : {len(fp['fsample'])}개")
-            print(f"  feat NaN : {nan_cnt}/19  {P}")
+            print(f"  points: {len(fp['fsample'])}개  feat NaN: {nan_cnt}/19  [{PASS}]")
         except Exception as e:
-            print(f"  {W} {e}")
+            print(f"  [{WARN}] {e}")
 
-    # ── 7. H5 저장 ───────────────────────────────────────────
+    # age / gender (WFDB 헤더 보완)
     age    = rec_info.get("age",    -1.0)
     gender = rec_info.get("gender",  0)
-    # WFDB 헤더 보완
-    if age == -1.0 or gender == 0:
+    if rec_info.get("source") == "wfdb" and (age == -1.0 or gender == 0):
         for c in (getattr(rec, "comments", []) or []):
             cl = c.strip().lstrip("#").strip().lower()
             if age == -1.0 and cl.startswith("age:"):
@@ -194,11 +196,10 @@ def test_one(dataset_name: str, cfg: dict, output_root: Path, args) -> dict:
 
     pid       = rec_info["pid"]
     rid       = rec_info["rid"]
-    sid       = 0
     file_name = f"{prefix}{pid}{rid}"
-    oid       = f"{prefix}{pid}{rid}{sid}"
     h5_path   = h5_dir / f"{file_name}.h5"
 
+    # 7. H5 저장
     print(f"[7] H5 저장: {h5_path.name}")
     try:
         with h5py.File(h5_path, "w") as h5f:
@@ -220,63 +221,57 @@ def test_one(dataset_name: str, cfg: dict, output_root: Path, args) -> dict:
                 fiducial_point      = fp_list,
                 fiducial_feature    = ff_list,
             )
-        print(f"  {P} 저장 완료")
+        print(f"  [{PASS}] 저장 완료")
     except Exception as e:
-        print(f"  {F} 저장 실패: {e}")
-        return {"dataset": dataset_name, "status": "FAIL", "reason": str(e)}
+        print(f"  [{FAIL}] 저장 실패: {e}")
+        return {"dataset": dataset_name, "status": FAIL, "reason": str(e)}
 
-    # ── 8. H5 검증 ───────────────────────────────────────────
-    print("[8] H5 검증")
+    # 8. H5 검증
+    print("[8] H5 재로드 검증")
     errors = []
     sig_h5_shape = None
     try:
         with h5py.File(h5_path, "r") as f:
             fn_h5 = f.attrs.get("file_name", "")
-            fn_ok = fn_h5 == file_name
-            print(f"  file_name     : {fn_h5}  {P if fn_ok else F}")
-            if not fn_ok:
+            if fn_h5 != file_name:
                 errors.append(f"file_name 불일치: {fn_h5}")
+            print(f"  file_name  : {fn_h5}  {'[OK]' if fn_h5 == file_name else '[FAIL]'}")
 
             meta  = f["ECG/metadata"]
             fs_h5 = int(meta.attrs.get("fs", 0))
             sn    = [s.decode() if isinstance(s, bytes) else s for s in meta["sig_name"][()]]
             sn_ok = sn == TARGET_SIG_NAME
-            print(f"  fs            : {fs_h5}  {P if fs_h5==fs else F}")
-            print(f"  sig_name      : {P if sn_ok else F}  {sn if not sn_ok else ''}")
             if not sn_ok:
-                errors.append(f"sig_name 불일치")
+                errors.append(f"sig_name 불일치: {sn}")
+            print(f"  fs         : {fs_h5}  sig_name: {'[OK]' if sn_ok else '[FAIL]'}")
 
-            s0          = f["ECG/segments/0"]
-            sig_h5      = s0["signal"][()]
+            s0           = f["ECG/segments/0"]
+            sig_h5       = s0["signal"][()]
             sig_h5_shape = sig_h5.shape
-            sh_ok       = sig_h5.shape[0] == 12
-            print(f"  signal shape  : {sig_h5.shape}  dtype={sig_h5.dtype}  {P if sh_ok else F}")
-            if not sh_ok:
-                errors.append(f"shape[0]={sig_h5.shape[0]} ≠ 12")
+            if sig_h5.shape[0] != 12:
+                errors.append(f"shape[0]={sig_h5.shape[0]} != 12")
 
-            orig = sig_reordered.astype(np.float32)
-            h5v  = sig_h5.astype(np.float32)
-            mask = ~(np.isnan(orig) | np.isnan(h5v))
+            orig   = sig_reordered.astype(np.float32)
+            h5v    = sig_h5.astype(np.float32)
+            mask   = ~(np.isnan(orig) | np.isnan(h5v))
             val_ok = np.allclose(orig[mask], h5v[mask], atol=0.01) if mask.any() else True
-            print(f"  값 일치       : {P if val_ok else F}")
             if not val_ok:
                 errors.append("signal 값 불일치")
+            print(f"  shape      : {sig_h5.shape}  dtype={sig_h5.dtype}  값일치: {'[OK]' if val_ok else '[FAIL]'}")
 
             if "beat_annotation" in s0:
-                print(f"  beat_annotation: {s0['beat_annotation/sample'].shape[0]}개  {P}")
+                print(f"  beat_annot : {s0['beat_annotation/sample'].shape[0]}개 R-peak")
             if "fiducial_feature" in s0:
                 nc = sum(1 for k in FIDUCIAL_FEATURE_KEYS
                          if np.isnan(float(s0["fiducial_feature"].attrs.get(k, float("nan")))))
-                print(f"  fiducial_feat  : NaN {nc}/19  {P}")
-
+                print(f"  fiducial   : NaN {nc}/19")
     except Exception as e:
         errors.append(f"재로드 실패: {e}")
 
-    status = "PASS" if not errors else "FAIL"
-    icon   = P if status == "PASS" else F
-    print(f"\n  {icon} {dataset_name}: {status}")
+    status = PASS if not errors else FAIL
+    print(f"\n  [{status}] {dataset_name}")
     for err in errors:
-        print(f"    {F} {err}")
+        print(f"    [{FAIL}] {err}")
 
     return {
         "dataset":   dataset_name,
@@ -295,66 +290,108 @@ def test_one(dataset_name: str, cfg: dict, output_root: Path, args) -> dict:
 # ═══════════════════════════════════════════════════════════════
 def main():
     parser = argparse.ArgumentParser(
-        description="공개 데이터셋 H5 변환 테스트 (데이터셋별 1개)",
+        description="ECG H5 변환 테스트 — 데이터셋별 첫 번째 유효 레코드 1개",
         formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+예시:
+  # physionet 8개
+  python test_convert.py --group physionet \\
+      --physionet_root /data/raw/physionet.org/files \\
+      --output_root /tmp/h5_test
+
+  # HEEDB
+  python test_convert.py --group heedb \\
+      --heedb_root /data/raw/heedb/ECG \\
+      --output_root /tmp/h5_test
+
+  # 전체
+  python test_convert.py --group all \\
+      --heedb_root ... --physionet_root ... --zzu_root ... \\
+      --output_root /tmp/h5_test
+
+  # 특정 데이터셋 + beat/fiducial
+  python test_convert.py --dataset georgia,heedb_i0001 \\
+      --physionet_root ... --heedb_root ... \\
+      --output_root /tmp/h5_test \\
+      --compute_beat --compute_fiducial
+        """,
     )
     target_grp = parser.add_mutually_exclusive_group()
-    target_grp.add_argument("--group",   type=str, choices=["physionet", "zzu", "all"])
-    target_grp.add_argument("--dataset", type=str, help="쉼표 구분: georgia,ptbxl")
+    target_grp.add_argument("--group",   type=str,
+                            choices=["heedb", "physionet", "zzu", "all"],
+                            help="그룹 단위 테스트")
+    target_grp.add_argument("--dataset", type=str,
+                            help="쉼표 구분 데이터셋명 (예: georgia,ptbxl,heedb_i0001)")
 
+    parser.add_argument("--heedb_root",    type=str,
+                        default="/home/irteam/opendata1/raw/heedb/ECG")
     parser.add_argument("--physionet_root", type=str,
                         default="/home/irteam/ddn-opendata1/raw/physionet.org/files")
     parser.add_argument("--zzu_root",       type=str,
                         default="/home/irteam/ddn-opendata1/raw/ZZU-pECG")
-    parser.add_argument("--output_root",    type=str, default="/tmp/h5_public_test")
-    parser.add_argument("--compute_beat",     action="store_true")
-    parser.add_argument("--compute_fiducial", action="store_true")
+    parser.add_argument("--output_root",    type=str, default="/tmp/h5_test")
+    parser.add_argument("--compute_beat",     action="store_true", help="beat_annotation 테스트")
+    parser.add_argument("--compute_fiducial", action="store_true", help="fiducial 테스트")
     args = parser.parse_args()
 
     output_root = Path(args.output_root)
     os.makedirs(output_root, exist_ok=True)
 
-    configs = _build_configs(args.physionet_root, args.zzu_root)
+    configs = _build_all_configs(args)
 
-    if args.group == "physionet":
+    if args.group == "heedb":
+        target_datasets = HEEDB_DATASETS
+    elif args.group == "physionet":
         target_datasets = PHYSIONET_DATASETS
     elif args.group == "zzu":
         target_datasets = ZZU_DATASETS
     elif args.group == "all":
-        target_datasets = PHYSIONET_DATASETS + ZZU_DATASETS
+        target_datasets = HEEDB_DATASETS + PHYSIONET_DATASETS + ZZU_DATASETS
     elif args.dataset:
         target_datasets = [d.strip() for d in args.dataset.split(",")]
         unknown = [d for d in target_datasets if d not in configs]
         if unknown:
-            print(f"알 수 없는 데이터셋: {unknown}\n선택 가능: {list(configs.keys())}")
+            print(f"알 수 없는 데이터셋: {unknown}")
+            print(f"선택 가능: {list(configs.keys())}")
             sys.exit(1)
     else:
         parser.print_help()
         return
 
+    # 경로가 지정되지 않은 데이터셋 제외
+    available = [d for d in target_datasets if d in configs]
+    skipped   = [d for d in target_datasets if d not in configs]
+    if skipped:
+        print(f"\n[SKIP] 경로 미지정으로 건너뜀: {skipped}")
+
     results = []
-    for ds_name in target_datasets:
+    for ds_name in available:
         result = test_one(ds_name, configs[ds_name], output_root, args)
         results.append(result)
 
     # 최종 요약
-    print(f"\n\n{'='*70}")
+    print(f"\n\n{'='*72}")
     print(f"  최종 요약")
-    print(f"{'='*70}")
-    print(f"  {'데이터셋':<20} {'상태':<6} {'file_name':<28} {'fs':>5}  {'shape':<16} age / gender")
-    print(f"  {'-'*70}")
+    print(f"{'='*72}")
+    header = f"  {'상태':<6}  {'데이터셋':<20}  {'file_name':<26}  {'fs':>5}  shape"
+    print(header)
+    print(f"  {'-'*68}")
     for r in results:
-        icon  = P if r["status"] == "PASS" else (W if r["status"] == "SKIP" else F)
-        print(f"  {icon} {r['dataset']:<18} {r['status']:<6} "
-              f"{r.get('file_name','-'):<28} {str(r.get('fs','-')):>5}  "
-              f"{str(r.get('shape','-')):<16} "
-              f"{r.get('age',-1):.4f} / {r.get('gender',0)}")
+        icon = PASS if r["status"] == PASS else FAIL
+        print(
+            f"  [{icon}]  {r['dataset']:<20}  "
+            f"{r.get('file_name', '-'):<26}  "
+            f"{str(r.get('fs', '-')):>5}  "
+            f"{str(r.get('shape', '-'))}"
+        )
+        for err in r.get("errors", []):
+            print(f"           [{FAIL}] {err}")
 
-    n_pass = sum(1 for r in results if r["status"] == "PASS")
-    n_fail = sum(1 for r in results if r["status"] != "PASS")
-    print(f"\n  {P} PASS {n_pass}  {F} FAIL/SKIP {n_fail}  / 전체 {len(results)}")
+    n_pass = sum(1 for r in results if r["status"] == PASS)
+    n_fail = len(results) - n_pass
+    print(f"\n  PASS {n_pass} / FAIL {n_fail} / 전체 {len(results)}")
     print(f"  출력: {output_root}")
-    print(f"{'='*70}\n")
+    print(f"{'='*72}\n")
 
 
 if __name__ == "__main__":

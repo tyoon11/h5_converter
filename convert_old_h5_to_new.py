@@ -55,7 +55,7 @@ import ray
 from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from heedb.create_h5_structure_heedb import create_h5_structure, TARGET_SIG_NAME, FIDUCIAL_FEATURE_KEYS
+from utils.h5_structure import create_h5_structure, TARGET_SIG_NAME, FIDUCIAL_FEATURE_KEYS
 
 # ─────────────────────────────────────────────────────────────
 # prefix 규칙 (모두 소문자)

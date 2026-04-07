@@ -49,11 +49,9 @@ import ray
 from pathlib import Path
 from tqdm import tqdm
 
-# heedb/ 모듈 경로
-HEEDB_DIR = str(Path(__file__).resolve().parent / "heedb")
-sys.path.insert(0, HEEDB_DIR)
+SCRIPT_DIR = str(Path(__file__).resolve().parent)
 
-from utils_heedb import signal_statistics, beat_similarity
+from utils.signal_processing import signal_statistics, beat_similarity
 
 # 품질 컬럼 정의
 QUALITY_COLS = ["nan_ratio", "amp_mean", "amp_std", "amp_skewness", "amp_kurtosis", "bs_corr", "bs_dtw"]
@@ -83,7 +81,7 @@ def load_signal_from_h5(h5_path: str) -> tuple[np.ndarray, int]:
 def compute_quality_one(
     row_idx: int,
     h5_path: str,
-    heedb_dir: str,
+    script_dir: str,
     compute_dtw: bool,
 ) -> dict | None:
     """
@@ -94,8 +92,8 @@ def compute_quality_one(
         실패 시 None
     """
     import sys, os
-    sys.path.insert(0, heedb_dir)
-    from utils_heedb import signal_statistics, beat_similarity
+    sys.path.insert(0, script_dir)
+    from utils.signal_processing import signal_statistics, beat_similarity
 
     if not os.path.isfile(h5_path):
         return None
@@ -247,7 +245,7 @@ def run(args):
             # filepath: "data/ptb_xl/px12345_0.h5" 또는 "data/he1...h5"
             h5_path = str(h5_root / filepath)
             futures.append(
-                compute_quality_one.remote(row_idx, h5_path, HEEDB_DIR, not args.no_dtw)
+                compute_quality_one.remote(row_idx, h5_path, SCRIPT_DIR, not args.no_dtw)
             )
 
         for fut in futures:
