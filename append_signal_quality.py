@@ -62,15 +62,19 @@ QUALITY_COLS = ["nan_ratio", "amp_mean", "amp_std", "amp_skewness", "amp_kurtosi
 # ═══════════════════════════════════════════════════════════════
 def load_signal_from_h5(h5_path: str) -> tuple[np.ndarray, int]:
     """
-    H5 파일의 첫 번째 세그먼트 신호를 읽어 반환.
+    H5 파일의 모든 세그먼트 신호를 시간축으로 연결하여 반환.
 
     Returns:
-        sig: (timepoints, 12) float32
+        sig: (timepoints, 12) float32  — 전 세그먼트 concat
         fs:  sampling rate (int)
     """
     with h5py.File(h5_path, "r") as f:
-        fs = int(f["ECG/metadata"].attrs.get("fs", 500))
-        sig = f["ECG/segments/0/signal"][()].astype(np.float32)  # (12, T)
+        fs      = int(f["ECG/metadata"].attrs.get("fs", 500))
+        seg_grp = f["ECG/segments"]
+        n_segs  = int(seg_grp.attrs.get("seg_len", 1))
+        parts   = [seg_grp[str(i)]["signal"][()].astype(np.float32)
+                   for i in range(n_segs) if str(i) in seg_grp]
+    sig = np.concatenate(parts, axis=1) if len(parts) > 1 else parts[0]  # (12, T)
     return sig.T, fs   # (T, 12)
 
 
@@ -101,9 +105,13 @@ def compute_quality_one(
     try:
         import h5py, numpy as np
         with h5py.File(h5_path, "r") as f:
-            fs  = int(f["ECG/metadata"].attrs.get("fs", 500))
-            sig = f["ECG/segments/0/signal"][()].astype(np.float32).T  # (T, 12)
-        sig = np.nan_to_num(sig)
+            fs      = int(f["ECG/metadata"].attrs.get("fs", 500))
+            seg_grp = f["ECG/segments"]
+            n_segs  = int(seg_grp.attrs.get("seg_len", 1))
+            parts   = [seg_grp[str(i)]["signal"][()].astype(np.float32)
+                       for i in range(n_segs) if str(i) in seg_grp]
+        sig_ct = np.concatenate(parts, axis=1) if len(parts) > 1 else parts[0]  # (12, T)
+        sig    = np.nan_to_num(sig_ct.T)  # (T, 12)
     except Exception:
         return None
 

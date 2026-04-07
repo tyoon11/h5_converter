@@ -11,11 +11,12 @@ h5_converter/
 ├── convert_to_h5.py              # 통합 변환 스크립트 (HEEDB + 공개 데이터셋)
 ├── append_fiducial.py            # fiducial point/feature 후처리 추가
 ├── append_signal_quality.py      # 신호 품질 지표(bs_corr/bs_dtw) 후처리 추가
-├── verify_h5.py                  # H5 파일 검증
+├── verify_h5.py                  # H5 파일 검증 (데이터셋별 1개 상세 + 일괄)
 ├── convert_old_h5_to_new.py      # 구버전 H5 → 신규 포맷 마이그레이션
 ├── mimic_preprocessing.py        # MIMIC-IV-ECG 전용 전처리
-├── run_convert.sh                # 전체 파이프라인 일괄 실행 스크립트
-├── test_convert.py               # 전체 데이터셋 변환 테스트 (데이터셋별 1개)
+├── run_convert.sh                # 전체 변환 파이프라인 일괄 실행 스크립트
+├── run_test_verify.sh            # 테스트 + 검증 일괄 실행 스크립트
+├── test_convert.py               # 전체 데이터셋 변환 테스트 (데이터셋별 1개) + CSV 컬럼 검증
 ├── utils/
 │   ├── __init__.py
 │   ├── h5_structure.py           # H5 구조 생성 (create_h5_structure)
@@ -125,7 +126,7 @@ python append_signal_quality.py \
 ### 3. 검증
 
 ```bash
-# 전체 output_root 검증
+# 전체 output_root 검증 (데이터셋별 1개 상세 inspect + 일괄 검증)
 python verify_h5.py --output_root /data/h5/all/v1.0 --sample 200
 
 # 단일 파일 상세 검증
@@ -135,18 +136,45 @@ python verify_h5.py --file /data/h5/all/v1.0/data/psh12340.h5
 python verify_h5.py --output_root /data/h5/all/v1.0 --dataset ptbxl,georgia --sample 100
 ```
 
-### 4. 일괄 실행
+### 4. 변환 테스트 (소량 검증)
+
+데이터셋별로 첫 유효 레코드 1개만 변환하여 전체 파이프라인을 빠르게 점검합니다.
+종료 시 `ecg_table_test.csv`를 생성하고 `TABLE_COLS` 컬럼 일치 여부를 검증합니다.
+
+```bash
+# 그룹 단위
+python test_convert.py --group all \
+    --heedb_root /data/raw/heedb/ECG \
+    --physionet_root /data/raw/physionet.org/files \
+    --zzu_root /data/raw/ZZU-pECG \
+    --output_root /tmp/h5_test
+
+# 특정 데이터셋 + beat/fiducial 포함
+python test_convert.py --dataset georgia,heedb_i0001 \
+    --physionet_root ... --heedb_root ... \
+    --output_root /tmp/h5_test \
+    --compute_beat --compute_fiducial
+```
+
+### 5. 일괄 실행
 
 `run_convert.sh` 내 경로를 수정한 후 실행:
 
 ```bash
-bash run_convert.sh           # 전체 (heedb + physionet + zzu)
+bash run_convert.sh           # 전체 변환 (heedb + physionet + zzu)
 bash run_convert.sh heedb     # HEEDB만
 bash run_convert.sh physionet # PhysioNet만
 bash run_convert.sh zzu       # ZZU만
 ```
 
-### 5. 구버전 H5 마이그레이션
+`run_test_verify.sh`로 테스트 + 검증을 한 번에 수행:
+
+```bash
+bash run_test_verify.sh           # 전체 (test_convert → verify_h5)
+bash run_test_verify.sh heedb     # HEEDB만
+```
+
+### 6. 구버전 H5 마이그레이션
 
 code15, mimic4, physionet2021 구버전 H5를 새 포맷으로 변환:
 
@@ -175,13 +203,24 @@ python convert_old_h5_to_new.py --dataset all --num_cpus 32
     │   └── datasets: sig_name, fmt, adc_gain, baseline,
     │                 units, adc_res, adc_zero
     └── segments/
-        ├── attrs: seg_len
-        └── 0/
-            ├── signal              # float16, shape (12, timepoints)
-            ├── beat_annotation/    # 선택: sample, symbol, subtype, chan, num, aux_note
-            ├── fiducial_point/     # 선택: fsample, fiducial
-            └── fiducial_feature/   # 선택: attrs (p_amp, q_amp, ..., 19개)
+        ├── attrs: seg_len            # 세그먼트 개수 (10초 단위 분할)
+        ├── 0/
+        │   ├── signal              # float16, shape (12, fs*10)
+        │   ├── beat_annotation/    # 선택: sample, symbol, subtype, chan, num, aux_note
+        │   ├── fiducial_point/     # 선택: fsample, fiducial
+        │   └── fiducial_feature/   # 선택: attrs (p_amp, q_amp, ..., 19개)
+        ├── 1/  ...
+        └── N/  ...
 ```
+
+### 세그먼트 분할 규칙
+
+- 신호 길이 ≥ 10초인 경우 `fs * 10` 샘플 단위로 잘라 N개 세그먼트로 저장 (`seg_len = N`)
+- 끝의 10초 미만 잔여는 버립니다
+- 신호 길이 < 10초인 경우 1개 세그먼트로 그대로 저장 (`seg_len = 1`)
+- `beat_annotation` / `fiducial_point` / `fiducial_feature`는 세그먼트별로 독립 계산
+- `append_fiducial.py`, `append_signal_quality.py`도 모든 세그먼트를 순회하여 처리합니다
+  (signal_quality는 세그먼트를 시간축으로 concat한 후 통계를 계산)
 
 ### 리드 순서 (고정)
 
@@ -216,12 +255,14 @@ output_root/
 | `dataset` | 데이터셋 키 (예: `ptbxl`, `heedb_i0001`) |
 | `pid` | 환자 ID |
 | `rid` | 레코드 인덱스 |
-| `sid` | 세그먼트 (항상 `0`) |
+| `sid` | 세그먼트 ID (현재 항상 `0` — 파일 단위 1행) |
 | `oid` | 고유 관측 ID (`{prefix}{pid}{rid}{sid}`) |
 | `age` | 나이 (years/100, 범위 0~1.5) |
 | `gender` | 1=남, -1=여, 0=미상 |
+| `height` / `weight` | 키/몸무게 (미수집 시 NaN) |
 | `fs` | 샘플링 주파수 (Hz) |
-| `nan_ratio` ~ `amp_kurtosis` | per-lead 신호 통계 (12-element list) |
+| `channel_name` | 채널 순서 문자열 (`TARGET_SIG_NAME` 직렬화) |
+| `nan_ratio` ~ `amp_kurtosis` | per-lead 신호 통계 (12-element list, 전 세그먼트 concat 기준) |
 | `bs_corr` | per-lead beat-to-beat 상관계수 (**별도 계산**) |
 | `bs_dtw` | per-lead beat-to-beat DTW 거리 (**별도 계산**) |
 

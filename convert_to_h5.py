@@ -99,6 +99,15 @@ COMBINED_COLUMNS = [
 # ═══════════════════════════════════════════════════════════════
 # 공통 헬퍼
 # ═══════════════════════════════════════════════════════════════
+def normalize_pid(val) -> str:
+    """HEEDB I0006 등 일부 metadata.csv는 BDSPPatientID가 '179020000.0' 처럼
+    float 형태로 export되어 있어 끝의 '.0'을 제거합니다."""
+    s = str(val).strip()
+    if s.endswith(".0") and s[:-2].isdigit():
+        return s[:-2]
+    return s
+
+
 def encode_gender(val):
     if not isinstance(val, str):
         return 0
@@ -159,7 +168,7 @@ def _get_heedb_records(base_dir: str, gender_field: str) -> list:
     df = pd.read_csv(meta_path, dtype=str, low_memory=False)
     records = []
     for rid, row in df.iterrows():
-        pid = str(row.get("BDSPPatientID", "")).strip()
+        pid = normalize_pid(row.get("BDSPPatientID", ""))
         fn_raw = str(row.get("FileName", "")).strip().lstrip("/")
         fn_clean = fn_raw[5:] if fn_raw.startswith("WFDB/") else fn_raw
         if not pid or pid == "nan":
@@ -305,6 +314,18 @@ def process_one(
     idx = [raw_names.index(n) for n in TARGET_SIG_NAME]
     sig_reordered = sig[:, idx].T.astype(np.float16)
 
+    # 10초 세그먼트 분할 (10초 미만이면 1개 세그먼트로 그대로 저장)
+    SEG_SEC     = 10
+    seg_samples = int(fs * SEG_SEC)
+    total_samp  = sig_reordered.shape[1]
+    if total_samp >= seg_samples:
+        n_segs   = total_samp // seg_samples
+        sig_segs = [sig_reordered[:, i * seg_samples:(i + 1) * seg_samples]
+                    for i in range(n_segs)]
+    else:
+        n_segs   = 1
+        sig_segs = [sig_reordered]
+
     fmt_r   = [d["fmt"][i]      for i in idx] if d.get("fmt")      else None
     gain_r  = [d["adc_gain"][i] for i in idx] if d.get("adc_gain") else None
     bl_r    = [d["baseline"][i] for i in idx] if d.get("baseline") else None
@@ -319,30 +340,37 @@ def process_one(
     oid       = f"{prefix}{pid}{rid}{sid}"
     h5_path   = os.path.join(h5_dir, f"{file_name}.h5")
 
-    # beat_annotation (옵션)
+    # beat_annotation (옵션) — 세그먼트별 계산
     ba_list, beat_method = None, ""
     if compute_beat:
-        try:
-            ba = extract_beat_annotation(
-                np.nan_to_num(sig_reordered[1].astype(np.float32)), fs
-            )
-            ba_list     = [ba]
-            beat_method = "neurokit2"
-        except Exception:
-            pass
+        ba_list = []
+        for seg in sig_segs:
+            try:
+                ba = extract_beat_annotation(
+                    np.nan_to_num(seg[1].astype(np.float32)), fs
+                )
+            except Exception:
+                ba = {"sample": [], "symbol": [], "subtype": [], "chan": [],
+                      "num": [], "aux_note": []}
+            ba_list.append(ba)
+        beat_method = "neurokit2"
 
-    # fiducial (옵션)
+    # fiducial (옵션) — 세그먼트별 계산
     fp_list, ff_list, fidu_method = None, None, ""
     if compute_fiducial:
-        try:
-            fp, ff = extract_fiducial(
-                np.nan_to_num(sig_reordered.astype(np.float32)), fs
-            )
-            fp_list     = [fp]
-            ff_list     = [ff]
-            fidu_method = "neurokit2-dwt"
-        except Exception:
-            pass
+        fp_list = []
+        ff_list = []
+        for seg in sig_segs:
+            try:
+                fp, ff = extract_fiducial(
+                    np.nan_to_num(seg.astype(np.float32)), fs
+                )
+            except Exception:
+                fp = {"fsample": [], "fiducial": []}
+                ff = {}
+            fp_list.append(fp)
+            ff_list.append(ff)
+        fidu_method = "neurokit2-dwt"
 
     # H5 저장
     try:
@@ -359,7 +387,7 @@ def process_one(
                 sig_name=TARGET_SIG_NAME,
                 fmt=fmt_r, adc_gain=gain_r, baseline=bl_r,
                 units=units_r, adc_res=res_r, adc_zero=zero_r,
-                signal=[sig_reordered], seg_len=1,
+                signal=sig_segs, seg_len=n_segs,
                 beat_annotation=ba_list,
                 fiducial_point=fp_list,
                 fiducial_feature=ff_list,

@@ -39,6 +39,15 @@ from utils.h5_structure import TARGET_SIG_NAME, FIDUCIAL_FEATURE_KEYS
 # NaN 리드가 일부 허용되는 데이터셋 (8채널 등)
 PARTIAL_LEAD_DATASETS = {"code15"}
 
+# 파일명 prefix → 데이터셋 이름 (convert_to_h5.py 기준)
+PREFIX_TO_DATASET = {
+    "he1": "heedb_i0001", "he6": "heedb_i0006",
+    "psh": "chapman",     "pcp": "cpsc2018",   "pce": "cpsc_extra",
+    "pge": "georgia",     "pnb": "ningbo",     "ppt": "ptb",
+    "ppx": "ptbxl",       "pin": "stpetersburg",
+    "zzu": "zzu_pecg",
+}
+
 
 # ═══════════════════════════════════════════════════════════════
 # 단일 파일 상세 출력
@@ -281,27 +290,119 @@ def validate_output_root(
 
     if not ds_dirs:
         # flat 구조 (data/ 직하에 .h5 파일들)도 지원
-        h5_files = list(data_root.glob("*.h5"))
-        if h5_files:
-            print(f"\n{'='*60}")
-            print(f"  전체 검증 (flat): {output_root}")
-            print(f"{'='*60}\n")
-            result = batch_validate(
-                str(data_root),
-                dataset_name    = "data",
-                sample_n        = sample_n,
-                allow_nan_leads = allow_nan_leads,
-            )
-            if result:
-                print_batch_result(result)
-        else:
+        h5_files = sorted(data_root.glob("*.h5"))
+        if not h5_files:
             print("[ERROR] 검증할 데이터셋 폴더 또는 H5 파일이 없습니다.")
+            return
+
+        print(f"\n{'='*60}")
+        print(f"  전체 검증 (flat): {output_root}")
+        print(f"{'='*60}\n")
+
+        # prefix 기반 데이터셋 그룹화
+        ds_files: dict = {}
+        for p in h5_files:
+            prefix = p.name[:3]
+            ds     = PREFIX_TO_DATASET.get(prefix, "unknown")
+            if target_datasets and ds not in target_datasets:
+                continue
+            ds_files.setdefault(ds, []).append(p)
+
+        if not ds_files:
+            print("[ERROR] 대상 데이터셋의 H5 파일이 없습니다.")
+            return
+
+        # ─── 데이터셋별 1개 파일 상세 inspect ───
+        print(f"{'─'*60}")
+        print(f"  데이터셋별 샘플 1개 상세 검증")
+        print(f"{'─'*60}")
+        for ds in sorted(ds_files):
+            sample = ds_files[ds][0]
+            print(f"\n  ▶ [{ds}] {sample.name}")
+            inspect_one(str(sample))
+            allow  = allow_nan_leads or ds in PARTIAL_LEAD_DATASETS
+            issues = validate_one(str(sample), allow_nan_leads=allow)
+            if issues:
+                print(f"\n  [FAIL] {ds} 샘플 검증 실패")
+                for iss in issues:
+                    print(f"    - {iss}")
+            else:
+                print(f"\n  [OK] {ds} 샘플 검증 통과")
+
+        # ─── 데이터셋별 일괄 검증 ───
+        print(f"\n{'─'*60}")
+        print(f"  데이터셋별 일괄 검증")
+        print(f"{'─'*60}")
+        all_results = []
+        grand_total = 0
+        grand_ok    = 0
+        for ds in sorted(ds_files):
+            files = ds_files[ds]
+            allow = allow_nan_leads or ds in PARTIAL_LEAD_DATASETS
+            if sample_n and sample_n < len(files):
+                import random
+                random.seed(42)
+                files = random.sample(files, sample_n)
+            ok, fail_files = 0, []
+            fs_dist, shape_dist, nan_lead_dist = Counter(), Counter(), Counter()
+            for p in tqdm(files, desc=f"  {ds}", leave=False):
+                issues = validate_one(str(p), allow_nan_leads=allow)
+                if issues:
+                    fail_files.append((p.name, issues))
+                else:
+                    ok += 1
+                    try:
+                        with h5py.File(str(p), "r") as f:
+                            fs_dist[int(f["ECG/metadata"].attrs.get("fs", 0))] += 1
+                            if "0" in f["ECG/segments"]:
+                                sig = f["ECG/segments/0/signal"][()].astype(np.float32)
+                                shape_dist[sig.shape] += 1
+                                full_nan = int(np.sum(np.all(np.isnan(sig), axis=1)))
+                                nan_lead_dist[full_nan] += 1
+                    except Exception:
+                        pass
+            res = {
+                "dataset": ds, "total": len(files), "ok": ok,
+                "fail":    len(files) - ok, "fail_files": fail_files,
+                "fs_dist": dict(fs_dist), "shape_dist": dict(shape_dist),
+                "nan_lead_dist": dict(nan_lead_dist),
+            }
+            all_results.append(res)
+            grand_total += res["total"]
+            grand_ok    += res["ok"]
+            print_batch_result(res)
+
+        print(f"\n{'─'*60}")
+        grand_pct = 100 * grand_ok / grand_total if grand_total else 0
+        print(f"  전체 합계: {grand_ok:,}/{grand_total:,} ({grand_pct:.1f}%)")
+        print(f"{'─'*60}\n")
         return
 
     print(f"\n{'='*60}")
     print(f"  전체 검증: {output_root}")
     print(f"  대상: {[d.name for d in ds_dirs]}")
     print(f"{'='*60}\n")
+
+    # ─── 데이터셋별 1개 파일 상세 inspect ───
+    print(f"{'─'*60}")
+    print(f"  데이터셋별 샘플 1개 상세 검증")
+    print(f"{'─'*60}")
+    for ds_dir in ds_dirs:
+        sample_files = sorted(ds_dir.glob("*.h5"))
+        if not sample_files:
+            print(f"\n  ▶ [{ds_dir.name}] H5 없음 → 스킵")
+            continue
+        sample = sample_files[0]
+        print(f"\n  ▶ [{ds_dir.name}] {sample.name}")
+        inspect_one(str(sample))
+        allow  = allow_nan_leads or ds_dir.name in PARTIAL_LEAD_DATASETS
+        issues = validate_one(str(sample), allow_nan_leads=allow)
+        if issues:
+            print(f"\n  [FAIL] {ds_dir.name} 샘플 검증 실패")
+            for iss in issues:
+                print(f"    - {iss}")
+        else:
+            print(f"\n  [OK] {ds_dir.name} 샘플 검증 통과")
 
     all_results = []
     grand_total = 0

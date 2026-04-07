@@ -41,6 +41,7 @@ import os
 import sys
 import argparse
 import numpy as np
+import pandas as pd
 import h5py
 from pathlib import Path
 
@@ -53,10 +54,61 @@ from utils.signal_processing import (
     extract_beat_annotation, extract_fiducial, signal_statistics, has_zero_lead,
 )
 from convert_to_h5 import (
-    _build_all_configs,
+    _build_all_configs, _make_table_df,
     PHYSIONET_DATASETS, ZZU_DATASETS, HEEDB_DATASETS,
-    LEAD_ALIASES,
+    LEAD_ALIASES, TABLE_COLS,
 )
+
+# HEEDB metadata.csv는 수백만 행이므로 테스트 시 앞부분만 읽음
+HEEDB_TEST_NROWS = 200
+
+
+def _patch_heedb_configs(configs: dict, heedb_root: str):
+    """HEEDB records_fn을 nrows=HEEDB_TEST_NROWS로 제한된 버전으로 교체."""
+    import os
+    import pandas as pd
+    from convert_to_h5 import encode_gender, normalize_pid
+
+    inst_map = {
+        "heedb_i0001": ("I0001", "SexDSC"),
+        "heedb_i0006": ("I0006", "Sex"),
+    }
+
+    for ds_name, (inst_code, gender_field) in inst_map.items():
+        if ds_name not in configs:
+            continue
+        base_dir  = os.path.join(heedb_root, inst_code)
+        wfdb_root = os.path.join(base_dir, "WFDB")
+        meta_path = os.path.join(base_dir, "metadata", "metadata.csv")
+
+        def _make_fn(_wfdb=wfdb_root, _meta=meta_path, _gf=gender_field):
+            def _fn():
+                if not os.path.exists(_meta):
+                    return []
+                df = pd.read_csv(_meta, dtype=str, low_memory=False,
+                                 nrows=HEEDB_TEST_NROWS)
+                records = []
+                for rid, row in df.iterrows():
+                    pid    = normalize_pid(row.get("BDSPPatientID", ""))
+                    fn_raw = str(row.get("FileName", "")).strip().lstrip("/")
+                    fn_clean = fn_raw[5:] if fn_raw.startswith("WFDB/") else fn_raw
+                    if not pid or pid == "nan":
+                        continue
+                    try:
+                        age = round(float(row.get("AgeAtAcquisition", -1)) / 365.25 / 100.0, 6)
+                    except (TypeError, ValueError):
+                        age = -1.0
+                    records.append({
+                        "record_path": os.path.join(_wfdb, fn_clean),
+                        "pid": pid, "rid": rid,
+                        "age": age,
+                        "gender": encode_gender(str(row.get(_gf, ""))),
+                        "source": "heedb",
+                    })
+                return records
+            return _fn
+
+        configs[ds_name]["records_fn"] = _make_fn()
 
 TARGET_SET = set(TARGET_SIG_NAME)
 PASS = "OK"
@@ -135,6 +187,18 @@ def test_one(dataset_name: str, cfg: dict, output_root: Path, args) -> dict:
     nan_leads     = int(np.sum(np.all(np.isnan(sig_f32), axis=1)))
     print(f"  shape: {sig_reordered.shape}  NaN 리드: {nan_leads}/12")
 
+    # 10초 세그먼트 분할
+    SEG_SEC     = 10
+    seg_samples = int(fs * SEG_SEC)
+    n_segs      = max(1, sig_reordered.shape[1] // seg_samples)
+    if n_segs > 1:
+        trimmed = sig_reordered.shape[1] - n_segs * seg_samples
+        print(f"  → {n_segs}개 세그먼트 분할 "
+              f"({SEG_SEC}s × {n_segs}"
+              + (f", 끝 {trimmed}샘플 버림)" if trimmed else ")"))
+    sig_segs = [sig_reordered[:, i * seg_samples:(i + 1) * seg_samples]
+                for i in range(n_segs)]
+
     # 4. signal_statistics
     print("[4] signal_statistics")
     try:
@@ -143,32 +207,44 @@ def test_one(dataset_name: str, cfg: dict, output_root: Path, args) -> dict:
     except Exception as e:
         print(f"  [{WARN}] {e}")
 
-    # 5. beat_annotation (옵션)
+    # 5. beat_annotation (옵션) — 세그먼트별 계산
     ba_list, beat_method = None, ""
     if args.compute_beat:
         print("[5] beat_annotation")
-        try:
-            ba          = extract_beat_annotation(np.nan_to_num(sig_f32[1]), fs)
-            ba_list     = [ba]
-            beat_method = "neurokit2"
-            print(f"  R-peaks: {len(ba['sample'])}개  [{PASS}]")
-        except Exception as e:
-            print(f"  [{WARN}] {e}")
+        ba_list = []
+        for seg in sig_segs:
+            seg_f32 = seg.astype(np.float32)
+            try:
+                ba = extract_beat_annotation(np.nan_to_num(seg_f32[1]), fs)
+            except Exception:
+                ba = {"sample": [], "symbol": [], "subtype": [], "chan": [],
+                      "num": [], "aux_note": []}
+            ba_list.append(ba)
+        beat_method  = "neurokit2"
+        total_peaks  = sum(len(ba["sample"]) for ba in ba_list)
+        print(f"  R-peaks: {total_peaks}개 ({n_segs}개 세그먼트)  [{PASS}]")
 
-    # 6. fiducial (옵션)
+    # 6. fiducial (옵션) — 세그먼트별 계산
     fp_list, ff_list, fidu_method = None, None, ""
     if args.compute_fiducial:
         print("[6] fiducial")
-        try:
-            fp, ff      = extract_fiducial(np.nan_to_num(sig_f32), fs)
-            fp_list     = [fp]
-            ff_list     = [ff]
-            fidu_method = "neurokit2-dwt"
-            nan_cnt     = sum(1 for v in ff.values()
-                              if isinstance(v, (float, np.floating)) and np.isnan(v))
-            print(f"  points: {len(fp['fsample'])}개  feat NaN: {nan_cnt}/19  [{PASS}]")
-        except Exception as e:
-            print(f"  [{WARN}] {e}")
+        fp_list = []
+        ff_list = []
+        for seg in sig_segs:
+            seg_f32 = seg.astype(np.float32)
+            try:
+                fp, ff = extract_fiducial(np.nan_to_num(seg_f32), fs)
+            except Exception:
+                fp = {"fsample": [], "fiducial": []}
+                ff = {}
+            fp_list.append(fp)
+            ff_list.append(ff)
+        fidu_method = "neurokit2-dwt"
+        total_pts   = sum(len(fp["fsample"]) for fp in fp_list)
+        nan_cnt     = sum(1 for v in (ff_list[0] if ff_list else {}).values()
+                          if isinstance(v, (float, np.floating)) and np.isnan(v))
+        print(f"  points: {total_pts}개 ({n_segs}개 세그먼트)  "
+              f"feat NaN: {nan_cnt}/19  [{PASS}]")
 
     # age / gender (WFDB 헤더 보완)
     age    = rec_info.get("age",    -1.0)
@@ -215,8 +291,8 @@ def test_one(dataset_name: str, cfg: dict, output_root: Path, args) -> dict:
                 sig_name            = TARGET_SIG_NAME,
                 fmt=fmt_r, adc_gain=gain_r, baseline=bl_r,
                 units=units_r, adc_res=res_r, adc_zero=zero_r,
-                signal              = [sig_reordered],
-                seg_len             = 1,
+                signal              = sig_segs,
+                seg_len             = n_segs,
                 beat_annotation     = ba_list,
                 fiducial_point      = fp_list,
                 fiducial_feature    = ff_list,
@@ -245,22 +321,31 @@ def test_one(dataset_name: str, cfg: dict, output_root: Path, args) -> dict:
                 errors.append(f"sig_name 불일치: {sn}")
             print(f"  fs         : {fs_h5}  sig_name: {'[OK]' if sn_ok else '[FAIL]'}")
 
-            s0           = f["ECG/segments/0"]
+            seg_grp_h5   = f["ECG/segments"]
+            n_segs_h5    = int(seg_grp_h5.attrs.get("seg_len", 1))
+            s0           = seg_grp_h5["0"]
             sig_h5       = s0["signal"][()]
             sig_h5_shape = sig_h5.shape
             if sig_h5.shape[0] != 12:
                 errors.append(f"shape[0]={sig_h5.shape[0]} != 12")
 
-            orig   = sig_reordered.astype(np.float32)
+            orig   = sig_segs[0].astype(np.float32)
             h5v    = sig_h5.astype(np.float32)
             mask   = ~(np.isnan(orig) | np.isnan(h5v))
             val_ok = np.allclose(orig[mask], h5v[mask], atol=0.01) if mask.any() else True
             if not val_ok:
                 errors.append("signal 값 불일치")
-            print(f"  shape      : {sig_h5.shape}  dtype={sig_h5.dtype}  값일치: {'[OK]' if val_ok else '[FAIL]'}")
+            seg_info = f"  (세그먼트 {n_segs_h5}개)" if n_segs_h5 > 1 else ""
+            print(f"  shape      : {sig_h5.shape}  dtype={sig_h5.dtype}  "
+                  f"값일치: {'[OK]' if val_ok else '[FAIL]'}{seg_info}")
 
             if "beat_annotation" in s0:
-                print(f"  beat_annot : {s0['beat_annotation/sample'].shape[0]}개 R-peak")
+                total_peaks_h5 = sum(
+                    seg_grp_h5[str(i)]["beat_annotation/sample"].shape[0]
+                    for i in range(n_segs_h5)
+                    if "beat_annotation" in seg_grp_h5[str(i)]
+                )
+                print(f"  beat_annot : {total_peaks_h5}개 R-peak ({n_segs_h5}개 세그먼트)")
             if "fiducial_feature" in s0:
                 nc = sum(1 for k in FIDUCIAL_FEATURE_KEYS
                          if np.isnan(float(s0["fiducial_feature"].attrs.get(k, float("nan")))))
@@ -273,6 +358,27 @@ def test_one(dataset_name: str, cfg: dict, output_root: Path, args) -> dict:
     for err in errors:
         print(f"    [{FAIL}] {err}")
 
+    # CSV row (convert_to_h5.process_one 출력과 동일 스키마)
+    sid = 0
+    oid = f"{prefix}{pid}{rid}{sid}"
+    csv_row = {
+        "filepath":      f"data/{file_name}.h5",
+        "dataset":       dataset_name,
+        "pid":           pid,
+        "rid":           rid,
+        "sid":           sid,
+        "oid":           oid,
+        "age":           age,
+        "gender":        gender,
+        "height":        np.nan,
+        "weight":        np.nan,
+        "fs":            fs,
+        "channel_name":  str(TARGET_SIG_NAME),
+        "_record_name":  d["record_name"],
+        "_record_path":  rec_info["record_path"],
+        "_h5_filename":  f"{file_name}.h5",
+    }
+
     return {
         "dataset":   dataset_name,
         "status":    status,
@@ -282,6 +388,7 @@ def test_one(dataset_name: str, cfg: dict, output_root: Path, args) -> dict:
         "age":       age,
         "gender":    gender,
         "errors":    errors,
+        "csv_row":   csv_row if status == PASS else None,
     }
 
 
@@ -324,7 +431,7 @@ def main():
                             help="쉼표 구분 데이터셋명 (예: georgia,ptbxl,heedb_i0001)")
 
     parser.add_argument("--heedb_root",    type=str,
-                        default="/home/irteam/opendata1/raw/heedb/ECG")
+                        default="/home/irteam/ddn-opendata1/raw/heedb/ECG")
     parser.add_argument("--physionet_root", type=str,
                         default="/home/irteam/ddn-opendata1/raw/physionet.org/files")
     parser.add_argument("--zzu_root",       type=str,
@@ -338,6 +445,9 @@ def main():
     os.makedirs(output_root, exist_ok=True)
 
     configs = _build_all_configs(args)
+    # HEEDB는 metadata.csv가 수백만 행 → nrows=HEEDB_TEST_NROWS로 제한
+    if args.heedb_root:
+        _patch_heedb_configs(configs, args.heedb_root)
 
     if args.group == "heedb":
         target_datasets = HEEDB_DATASETS
@@ -392,6 +502,37 @@ def main():
     print(f"\n  PASS {n_pass} / FAIL {n_fail} / 전체 {len(results)}")
     print(f"  출력: {output_root}")
     print(f"{'='*72}\n")
+
+    # ─── CSV 생성 + 컬럼 검증 ───
+    csv_rows = [r["csv_row"] for r in results if r.get("csv_row") is not None]
+    if csv_rows:
+        print(f"{'='*72}")
+        print(f"  CSV 생성 및 컬럼 검증")
+        print(f"{'='*72}")
+        df       = _make_table_df(csv_rows)
+        csv_path = output_root / "ecg_table_test.csv"
+        df.to_csv(csv_path, index=False)
+        print(f"  ecg_table_test.csv : {len(df):,}행 → {csv_path}")
+        print(f"  컬럼 ({len(df.columns)}): {list(df.columns)}")
+
+        missing = [c for c in TABLE_COLS if c not in df.columns]
+        extra   = [c for c in df.columns  if c not in TABLE_COLS]
+        leaked  = [c for c in df.columns  if c.startswith("_")]
+
+        col_errs = []
+        if missing: col_errs.append(f"필수 컬럼 누락: {missing}")
+        if leaked:  col_errs.append(f"내부(_) 컬럼 누출: {leaked}")
+        if list(df.columns)[:len(TABLE_COLS)] != TABLE_COLS:
+            col_errs.append(f"TABLE_COLS 순서 불일치 (앞 {len(TABLE_COLS)}개 기준)")
+
+        if col_errs:
+            print(f"  [{FAIL}] 컬럼 검증 실패")
+            for e in col_errs:
+                print(f"    - {e}")
+        else:
+            print(f"  [{PASS}] 컬럼 검증 통과 (TABLE_COLS {len(TABLE_COLS)}개 일치"
+                  + (f", 추가 컬럼 {extra}" if extra else "") + ")")
+        print(f"{'='*72}\n")
 
 
 if __name__ == "__main__":

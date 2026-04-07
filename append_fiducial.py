@@ -90,99 +90,114 @@ def append_fiducial_one(
     if not os.path.isfile(h5_path):
         return {"path": h5_path, "status": "fail", "reason": "파일 없음"}
 
-    # ── 이미 있는지 확인 ──────────────────────────────────────
-    if not overwrite:
-        try:
-            with h5py.File(h5_path, "r") as f:
-                s0 = f.get("ECG/segments/0")
-                if s0 is None:
-                    return {"path": h5_path, "status": "fail", "reason": "segments/0 없음"}
-                has_beat = "beat_annotation" in s0
-                has_fidu = "fiducial_point"  in s0
-                need_beat = compute_beat and not has_beat
-                need_fidu = compute_fidu and not has_fidu
-                if not need_beat and not need_fidu:
-                    return {"path": h5_path, "status": "skip", "reason": "이미 존재"}
-        except Exception as e:
-            return {"path": h5_path, "status": "fail", "reason": str(e)}
-
-    # ── 신호 로드 ─────────────────────────────────────────────
+    # ── 세그먼트 목록 + skip 판단 ─────────────────────────────
     try:
         with h5py.File(h5_path, "r") as f:
-            fs      = int(f["ECG/metadata"].attrs.get("fs", 500))
-            sig     = f["ECG/segments/0/signal"][()].astype(np.float32)  # (12, T)
+            seg_grp = f.get("ECG/segments")
+            if seg_grp is None:
+                return {"path": h5_path, "status": "fail", "reason": "ECG/segments 없음"}
+            n_segs = int(seg_grp.attrs.get("seg_len", 0))
+            if n_segs == 0:
+                return {"path": h5_path, "status": "fail", "reason": "seg_len=0"}
+            fs = int(f["ECG/metadata"].attrs.get("fs", 500))
+
+            if not overwrite:
+                all_done = True
+                for i in range(n_segs):
+                    si = str(i)
+                    if si not in seg_grp:
+                        all_done = False
+                        break
+                    s = seg_grp[si]
+                    if compute_beat and "beat_annotation" not in s:
+                        all_done = False; break
+                    if compute_fidu and "fiducial_point" not in s:
+                        all_done = False; break
+                if all_done:
+                    return {"path": h5_path, "status": "skip", "reason": "이미 존재"}
+
+            # 신호 로드 (전 세그먼트)
+            seg_signals = []
+            for i in range(n_segs):
+                seg_signals.append(
+                    seg_grp[str(i)]["signal"][()].astype(np.float32)
+                )
     except Exception as e:
         return {"path": h5_path, "status": "fail", "reason": f"H5 읽기 실패: {e}"}
 
-    sig_clean = np.nan_to_num(sig)   # (12, T)
-
-    # ── beat_annotation 계산 ──────────────────────────────────
-    ba = None
+    # ── 세그먼트별 beat / fiducial 계산 ───────────────────────
+    ba_list = fp_list = ff_list = None
     if compute_beat:
-        try:
-            ba = extract_beat_annotation(sig_clean[1], fs)   # Lead II
-        except Exception:
-            ba = {"sample": [], "symbol": [], "subtype": [], "chan": [], "num": [], "aux_note": []}
-
-    # ── fiducial 계산 ─────────────────────────────────────────
-    fp = ff = None
+        ba_list = []
+        for sig in seg_signals:
+            try:
+                ba_list.append(extract_beat_annotation(np.nan_to_num(sig[1]), fs))
+            except Exception:
+                ba_list.append({"sample": [], "symbol": [], "subtype": [],
+                                "chan": [], "num": [], "aux_note": []})
     if compute_fidu:
-        try:
-            fp, ff = extract_fiducial(sig_clean, fs)
-        except Exception:
-            fp = {"fsample": [], "fiducial": []}
-            ff = {k: np.float16(np.nan) for k in FIDUCIAL_FEATURE_KEYS}
+        fp_list, ff_list = [], []
+        for sig in seg_signals:
+            try:
+                fp, ff = extract_fiducial(np.nan_to_num(sig), fs)
+            except Exception:
+                fp = {"fsample": [], "fiducial": []}
+                ff = {k: np.float16(np.nan) for k in FIDUCIAL_FEATURE_KEYS}
+            fp_list.append(fp); ff_list.append(ff)
 
     # ── H5에 기록 ─────────────────────────────────────────────
     try:
         with h5py.File(h5_path, "a") as f:
-            s0 = f["ECG/segments/0"]
+            seg_grp = f["ECG/segments"]
+            for i in range(n_segs):
+                s = seg_grp[str(i)]
 
-            # beat_annotation
-            if ba is not None:
-                if "beat_annotation" in s0:
-                    del s0["beat_annotation"]
-                ba_grp  = s0.create_group("beat_annotation")
-                samples = np.array(ba.get("sample", []), dtype=np.int16)
-                nb      = len(samples)
-                ba_grp.create_dataset("sample",   data=samples)
-                ba_grp.create_dataset("symbol",   data=np.array(ba.get("symbol",   [""]*nb), dtype=UTF8), dtype=UTF8)
-                ba_grp.create_dataset("subtype",  data=np.array(ba.get("subtype",  np.zeros(nb)), dtype=np.int16))
-                ba_grp.create_dataset("chan",      data=np.array(ba.get("chan",     np.zeros(nb)), dtype=np.int16))
-                ba_grp.create_dataset("num",       data=np.array(ba.get("num",      np.zeros(nb)), dtype=np.int16))
-                ba_grp.create_dataset("aux_note",  data=np.array(ba.get("aux_note", [""]*nb), dtype=UTF8), dtype=UTF8)
-                # root attr 갱신
+                if ba_list is not None:
+                    if "beat_annotation" in s:
+                        del s["beat_annotation"]
+                    ba      = ba_list[i]
+                    ba_grp  = s.create_group("beat_annotation")
+                    samples = np.array(ba.get("sample", []), dtype=np.int16)
+                    nb      = len(samples)
+                    ba_grp.create_dataset("sample",   data=samples)
+                    ba_grp.create_dataset("symbol",   data=np.array(ba.get("symbol",   [""]*nb), dtype=UTF8), dtype=UTF8)
+                    ba_grp.create_dataset("subtype",  data=np.array(ba.get("subtype",  np.zeros(nb)), dtype=np.int16))
+                    ba_grp.create_dataset("chan",     data=np.array(ba.get("chan",     np.zeros(nb)), dtype=np.int16))
+                    ba_grp.create_dataset("num",      data=np.array(ba.get("num",      np.zeros(nb)), dtype=np.int16))
+                    ba_grp.create_dataset("aux_note", data=np.array(ba.get("aux_note", [""]*nb), dtype=UTF8), dtype=UTF8)
+
+                if fp_list is not None:
+                    if "fiducial_point" in s:
+                        del s["fiducial_point"]
+                    fp      = fp_list[i]
+                    fp_grp  = s.create_group("fiducial_point")
+                    fs_arr  = fp.get("fsample",  [])
+                    fid_arr = fp.get("fiducial", [])
+                    fp_grp.create_dataset(
+                        "fsample",
+                        data=np.array(fs_arr,  dtype=np.int16) if len(fs_arr)  else np.array([], dtype=np.int16),
+                    )
+                    fp_grp.create_dataset(
+                        "fiducial",
+                        data=np.array(fid_arr, dtype=UTF8)    if len(fid_arr) else np.array([], dtype=UTF8),
+                        dtype=UTF8,
+                    )
+
+                if ff_list is not None:
+                    if "fiducial_feature" in s:
+                        del s["fiducial_feature"]
+                    ff     = ff_list[i]
+                    ff_grp = s.create_group("fiducial_feature")
+                    for key in FIDUCIAL_FEATURE_KEYS:
+                        val = ff.get(key, np.nan)
+                        try:
+                            ff_grp.attrs[key] = np.float16(val)
+                        except (TypeError, ValueError):
+                            ff_grp.attrs[key] = np.float16(np.nan)
+
+            if ba_list is not None:
                 f.attrs["beat_ext_method"] = "neurokit2"
-
-            # fiducial_point
-            if fp is not None:
-                if "fiducial_point" in s0:
-                    del s0["fiducial_point"]
-                fp_grp   = s0.create_group("fiducial_point")
-                fs_arr   = fp.get("fsample",  [])
-                fid_arr  = fp.get("fiducial", [])
-                fp_grp.create_dataset(
-                    "fsample",
-                    data=np.array(fs_arr,  dtype=np.int16) if len(fs_arr)  else np.array([], dtype=np.int16),
-                )
-                fp_grp.create_dataset(
-                    "fiducial",
-                    data=np.array(fid_arr, dtype=UTF8)    if len(fid_arr) else np.array([], dtype=UTF8),
-                    dtype=UTF8,
-                )
-
-            # fiducial_feature
-            if ff is not None:
-                if "fiducial_feature" in s0:
-                    del s0["fiducial_feature"]
-                ff_grp = s0.create_group("fiducial_feature")
-                for key in FIDUCIAL_FEATURE_KEYS:
-                    val = ff.get(key, np.nan)
-                    try:
-                        ff_grp.attrs[key] = np.float16(val)
-                    except (TypeError, ValueError):
-                        ff_grp.attrs[key] = np.float16(np.nan)
-                # root attr 갱신
+            if ff_list is not None:
                 f.attrs["fidu_extract_method"] = "neurokit2-dwt"
 
     except Exception as e:
