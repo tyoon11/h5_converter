@@ -72,6 +72,7 @@ PHYSIONET_DATASETS = [
     "chapman", "cpsc2018", "cpsc_extra", "georgia",
     "ningbo", "ptb", "ptbxl", "stpetersburg",
 ]
+CPSC2021_DATASETS = ["cpsc2021"]
 ZZU_DATASETS    = ["zzu_pecg"]
 HEEDB_DATASETS  = ["heedb_i0001", "heedb_i0006"]
 
@@ -129,6 +130,28 @@ def _scan_challenge(ds_dir: str) -> list:
          "age": -1.0, "gender": 0, "source": "wfdb"}
         for rid, p in enumerate(paths)
     ]
+
+
+def _scan_cpsc2021(ds_dir: str) -> list:
+    """CPSC2021: Training_set_I + Training_set_II 스캔 (2리드, fs=200)"""
+    records = []
+    rid = 0
+    for subset in ["Training_set_I", "Training_set_II"]:
+        sub_dir = os.path.join(ds_dir, subset)
+        if not os.path.isdir(sub_dir):
+            continue
+        paths = sorted(p[:-4] for p in glob.glob(os.path.join(sub_dir, "*.hea")))
+        for p in paths:
+            records.append({
+                "record_path": p,
+                "pid": os.path.basename(p),
+                "rid": rid,
+                "age": -1.0,
+                "gender": 0,
+                "source": "wfdb",
+            })
+            rid += 1
+    return records
 
 
 def _get_zzu_records(zzu_root: str) -> list:
@@ -214,6 +237,15 @@ def _build_all_configs(args) -> dict:
                 "records_fn": lambda _d=d: _scan_challenge(_d),
             }
 
+    # cpsc2021
+    if getattr(args, "cpsc2021_root", None):
+        d = os.path.join(args.cpsc2021_root, "1.0.0")
+        configs["cpsc2021"] = {
+            "name": "cpsc2021", "prefix": "c21", "group": "cpsc2021",
+            "records_fn": lambda _d=d: _scan_cpsc2021(_d),
+            "target_sig_name": None,  # 리드 그대로 저장
+        }
+
     # zzu
     if args.zzu_root:
         configs["zzu_pecg"] = {
@@ -249,12 +281,20 @@ def process_one(
     script_dir:       str,
     compute_beat:     bool,
     compute_fiducial: bool,
+    target_sig_name:  list = None,
 ):
+    """
+    레코드 1개를 H5로 변환합니다.
+
+    target_sig_name:
+      - list (예: TARGET_SIG_NAME 12개) → 해당 리드만 reorder, n_sig 불일치 시 스킵
+      - None → 원본 리드를 그대로 저장 (2리드 등 가변 리드 지원)
+    """
     import os, sys, h5py
     import numpy as np
     import wfdb
     sys.path.insert(0, script_dir)
-    from utils.h5_structure import create_h5_structure, TARGET_SIG_NAME
+    from utils.h5_structure import create_h5_structure, TARGET_SIG_NAME as _DEFAULT_SIG
     from utils.signal_processing import (
         reorder_signal, has_zero_lead,
         extract_beat_annotation, extract_fiducial,
@@ -268,7 +308,13 @@ def process_one(
         "v1": "V1",  "v2": "V2",   "v3": "V3",
         "v4": "V4",  "v5": "V5",   "v6": "V6",
     }
-    _TARGET_SET = set(TARGET_SIG_NAME)
+
+    # 기본값: 12리드 표준
+    if target_sig_name is None:
+        _use_raw_leads = True
+    else:
+        _use_raw_leads = False
+        _TARGET_SET = set(target_sig_name)
 
     # WFDB 로드
     try:
@@ -286,16 +332,34 @@ def process_one(
     raw_names = [_ALIASES.get(n, n) for n in rec.sig_name]
 
     # 스킵 조건
-    if d["n_sig"] != 12:              return None
-    if set(raw_names) != _TARGET_SET: return None
-    if sig.shape[0] / fs < 1.0:      return None
-    if has_zero_lead(sig):            return None
+    if sig.shape[0] / fs < 1.0:
+        return None
+
+    if _use_raw_leads:
+        # 원본 리드 그대로 사용
+        actual_sig_name = raw_names
+        n_sig           = d["n_sig"]
+        sig_reordered   = sig.T.astype(np.float16)  # (n_sig, samples)
+        idx             = list(range(n_sig))
+        if has_zero_lead(sig):
+            return None
+    else:
+        # 12리드 표준 reorder
+        if d["n_sig"] != len(target_sig_name):
+            return None
+        if set(raw_names) != _TARGET_SET:
+            return None
+        if has_zero_lead(sig):
+            return None
+        actual_sig_name = target_sig_name
+        n_sig           = len(target_sig_name)
+        idx             = [raw_names.index(n) for n in target_sig_name]
+        sig_reordered   = sig[:, idx].T.astype(np.float16)
 
     # age / gender — HEEDB는 rec_info에 이미 설정됨, 공개 데이터셋은 헤더 보완
     age    = rec_info.get("age",    -1.0)
     gender = rec_info.get("gender",  0)
     if rec_info.get("source") == "wfdb":
-        # 공개 데이터셋: WFDB 헤더에서 age/gender 보완
         if age == -1.0 or gender == 0:
             for c in (getattr(rec, "comments", []) or []):
                 cl = c.strip().lstrip("#").strip().lower()
@@ -310,11 +374,7 @@ def process_one(
                     v = cl.split(":", 1)[1].strip().split()[0].lower()
                     gender = 1 if v in ("male", "m", "1") else (-1 if v in ("female", "f", "0") else 0)
 
-    # reorder → (12, samples) fp16
-    idx = [raw_names.index(n) for n in TARGET_SIG_NAME]
-    sig_reordered = sig[:, idx].T.astype(np.float16)
-
-    # 10초 세그먼트 분할 (10초 미만이면 1개 세그먼트로 그대로 저장)
+    # 10초 세그먼트 분할
     SEG_SEC     = 10
     seg_samples = int(fs * SEG_SEC)
     total_samp  = sig_reordered.shape[1]
@@ -340,14 +400,15 @@ def process_one(
     oid       = f"{prefix}{pid}{rid}{sid}"
     h5_path   = os.path.join(h5_dir, f"{file_name}.h5")
 
-    # beat_annotation (옵션) — 세그먼트별 계산
+    # beat_annotation (옵션) — Lead II (index 1) 또는 첫 리드
+    beat_lead_idx = min(1, n_sig - 1)
     ba_list, beat_method = None, ""
     if compute_beat:
         ba_list = []
         for seg in sig_segs:
             try:
                 ba = extract_beat_annotation(
-                    np.nan_to_num(seg[1].astype(np.float32)), fs
+                    np.nan_to_num(seg[beat_lead_idx].astype(np.float32)), fs
                 )
             except Exception:
                 ba = {"sample": [], "symbol": [], "subtype": [], "chan": [],
@@ -381,10 +442,10 @@ def process_one(
                 beat_ext_method=beat_method,
                 fidu_extract_method=fidu_method,
                 record_name=d["record_name"],
-                n_sig=12, fs=fs, sig_len=sig_len,
+                n_sig=n_sig, fs=fs, sig_len=sig_len,
                 base_time=str(d.get("base_time", "") or ""),
                 base_date=str(d.get("base_date", "") or ""),
-                sig_name=TARGET_SIG_NAME,
+                sig_name=actual_sig_name,
                 fmt=fmt_r, adc_gain=gain_r, baseline=bl_r,
                 units=units_r, adc_res=res_r, adc_zero=zero_r,
                 signal=sig_segs, seg_len=n_segs,
@@ -409,7 +470,7 @@ def process_one(
         "height":        np.nan,
         "weight":        np.nan,
         "fs":            fs,
-        "channel_name":  str(TARGET_SIG_NAME),
+        "channel_name":  str(actual_sig_name),
         "_record_name":  d["record_name"],
         "_record_path":  rec_info["record_path"],
         "_h5_filename":  f"{file_name}.h5",
@@ -482,10 +543,11 @@ def process_dataset(dataset_name: str, cfg: dict, output_root: Path, args) -> li
     with tqdm(total=len(todo), desc=f"  {cfg['name']}", unit="rec") as pbar:
         for i in range(0, len(todo), args.batch_size):
             batch   = todo[i:i + args.batch_size]
+            tsn = cfg.get("target_sig_name", TARGET_SIG_NAME)
             futures = [
                 process_one.remote(
                     r, dataset_name, prefix, str(h5_dir), SCRIPT_DIR,
-                    args.compute_beat, args.compute_fiducial,
+                    args.compute_beat, args.compute_fiducial, tsn,
                 )
                 for r in batch
             ]
@@ -563,7 +625,7 @@ def main():
     # 대상 선택
     target_grp = parser.add_mutually_exclusive_group()
     target_grp.add_argument("--group", type=str,
-                            choices=["heedb", "physionet", "zzu", "all"],
+                            choices=["heedb", "physionet", "cpsc2021", "zzu", "all"],
                             help="그룹 단위 변환")
     target_grp.add_argument("--dataset", type=str,
                             help="쉼표 구분 데이터셋명 (예: georgia,ptbxl,heedb_i0001)")
@@ -578,6 +640,9 @@ def main():
     parser.add_argument("--zzu_root",       type=str,
                         default="/home/irteam/ddn-opendata1/raw/ZZU-pECG",
                         help="ZZU-pECG 데이터 루트")
+    parser.add_argument("--cpsc2021_root",  type=str,
+                        default="/home/irteam/ddn-opendata1/raw/physionet.org/files/cpsc2021",
+                        help="CPSC2021 데이터 루트")
     parser.add_argument("--output_root",    type=str, required=True,
                         help="H5 출력 루트")
 
@@ -608,10 +673,12 @@ def main():
         target_datasets = HEEDB_DATASETS
     elif args.group == "physionet":
         target_datasets = PHYSIONET_DATASETS
+    elif args.group == "cpsc2021":
+        target_datasets = CPSC2021_DATASETS
     elif args.group == "zzu":
         target_datasets = ZZU_DATASETS
     elif args.group == "all":
-        target_datasets = HEEDB_DATASETS + PHYSIONET_DATASETS + ZZU_DATASETS
+        target_datasets = HEEDB_DATASETS + PHYSIONET_DATASETS + CPSC2021_DATASETS + ZZU_DATASETS
     elif args.dataset:
         target_datasets = [d.strip() for d in args.dataset.split(",")]
         unknown = [d for d in target_datasets if d not in configs]

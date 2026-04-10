@@ -67,9 +67,9 @@ def create_h5_structure(
     if fmt is not None:
         meta_grp.create_dataset("fmt", data=np.array(fmt, dtype=UTF8), dtype=UTF8)
     if adc_gain is not None:
-        meta_grp.create_dataset("adc_gain", data=np.array(adc_gain, dtype=np.float16))
+        meta_grp.create_dataset("adc_gain", data=np.array(adc_gain, dtype=np.float32))
     if baseline is not None:
-        meta_grp.create_dataset("baseline", data=np.array(baseline, dtype=np.int16))
+        meta_grp.create_dataset("baseline", data=np.array(baseline, dtype=np.int32))
     if units is not None:
         meta_grp.create_dataset("units", data=np.array(units, dtype=UTF8), dtype=UTF8)
     if adc_res is not None:

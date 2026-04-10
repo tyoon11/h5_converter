@@ -46,6 +46,7 @@ PREFIX_TO_DATASET = {
     "pge": "georgia",     "pnb": "ningbo",     "ppt": "ptb",
     "ppx": "ptbxl",       "pin": "stpetersburg",
     "zzu": "zzu_pecg",
+    "c21": "cpsc2021",
 }
 
 
@@ -157,8 +158,11 @@ def validate_one(h5_path: str, allow_nan_leads: bool = False) -> list:
                 if "sig_name" in meta:
                     sn = [s.decode() if isinstance(s, bytes) else s
                           for s in meta["sig_name"][()]]
-                    if sn != TARGET_SIG_NAME:
-                        issues.append(f"sig_name 불일치: {sn}")
+                    n_sig = int(meta.attrs.get("n_sig", 12))
+                    if len(sn) != n_sig:
+                        issues.append(f"sig_name 길이({len(sn)}) ≠ n_sig({n_sig})")
+                else:
+                    n_sig = 12
 
             # segments
             if "segments" not in f["ECG"]:
@@ -179,8 +183,8 @@ def validate_one(h5_path: str, allow_nan_leads: bool = False) -> list:
                     issues.append(f"segment {i}: signal 없음")
                 else:
                     sig = segs[si]["signal"][()]
-                    if sig.shape[0] != 12:
-                        issues.append(f"segment {i}: signal shape[0]={sig.shape[0]} ≠ 12")
+                    if sig.shape[0] != n_sig:
+                        issues.append(f"segment {i}: signal shape[0]={sig.shape[0]} ≠ n_sig({n_sig})")
                     if not allow_nan_leads:
                         full_nan = int(np.sum(np.all(np.isnan(sig.astype(np.float32)), axis=1)))
                         if full_nan > 0:
